@@ -28,6 +28,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractButton,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -124,6 +125,10 @@ class MainWindow(QMainWindow):
         self._loading_started_at = 0.0
         self._loading_minimum_ms = 260
         self.sound_effects = SoundEffects(parent=self)
+        self._last_click_sound_at = 0.0
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.thumbnail_provider = ThumbnailProvider(
             project_service.database.db_path.parent / "thumbnails",
             self,
@@ -545,6 +550,9 @@ class MainWindow(QMainWindow):
         self._position_toast()
 
     def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress and self._should_play_click_sound(watched, event):
+            self._play_sound("bubble_pop")
+
         if hasattr(self, "content_widget") and watched == self.content_widget:
             if event.type() == QEvent.Type.Resize:
                 self._position_details_overlay(animated=False)
@@ -563,6 +571,32 @@ class MainWindow(QMainWindow):
             and hasattr(self, "projects_page")
             and self.stack.currentWidget() == self.projects_page
         )
+
+    def _should_play_click_sound(self, watched: object, event: object) -> bool:
+        if getattr(event, "button", lambda: None)() != Qt.MouseButton.LeftButton:
+            return False
+        if not isinstance(watched, QWidget):
+            return False
+
+        current: QWidget | None = watched
+        depth = 0
+        while current is not None and depth < 8:
+            if isinstance(current, (QAbstractButton, QComboBox, QLineEdit)):
+                now = monotonic()
+                if now - self._last_click_sound_at < 0.045:
+                    return False
+                self._last_click_sound_at = now
+                return True
+            class_name = current.metaObject().className()
+            if class_name in {"QSlider", "QSpinBox", "QDoubleSpinBox"}:
+                now = monotonic()
+                if now - self._last_click_sound_at < 0.045:
+                    return False
+                self._last_click_sound_at = now
+                return True
+            current = current.parentWidget()
+            depth += 1
+        return False
 
     def _position_details_overlay(self, *, animated: bool) -> None:
         if not hasattr(self, "details") or not hasattr(self, "content_widget"):
@@ -605,6 +639,7 @@ class MainWindow(QMainWindow):
         if self._details_expanded:
             return
         self._details_expanded = True
+        self._play_sound("right_side_drawer")
         self.details.set_collapsed(False)
         self._position_details_overlay(animated=True)
 
@@ -1392,6 +1427,7 @@ class MainWindow(QMainWindow):
         animation.finished.connect(finish_total)
         self._total_earnings_count_animation = animation
         update_total(start_value)
+        self._play_sound("earning_count")
         animation.start()
 
     def _published_earnings_state(
@@ -2025,6 +2061,7 @@ class MainWindow(QMainWindow):
             self.board.play_drop_confirmation(updated.id)
 
     def _show_move_blocked(self, reason: str) -> None:
+        self._play_sound("drag_failed")
         self._show_toast(f"Move blocked: {reason}")
 
     def _publish_project(self, project: Project) -> None:
@@ -2365,6 +2402,7 @@ class MainWindow(QMainWindow):
     def _edit_project_notes(self, project: Project) -> None:
         if project.id is None:
             return
+        self._play_sound("note_edit")
         current = self.project_service.get_project(project.id) or project
         revisions = self.project_service.list_project_revisions(project.id)
         dialog = NotesDialog(current, revisions, self)
@@ -2452,6 +2490,7 @@ class MainWindow(QMainWindow):
             )
         try:
             self.project_service.add_project_revision(project, note)
+            self._play_sound("revision")
             if project.id is None:
                 return
             if project.status != "Editing":

@@ -42,6 +42,18 @@ class SoundEffects(QObject):
 
     def _alias_for_path(self, path: Path) -> str | None:
         name = re.sub(r"[^a-z0-9]+", "_", path.stem.casefold()).strip("_")
+        if "earning" in name and "count" in name:
+            return "earning_count"
+        if "bubble" in name and "pop" in name:
+            return "bubble_pop"
+        if ("draging" in name or "dragging" in name or "drag" in name) and "failed" in name:
+            return "drag_failed"
+        if "note" in name and "edit" in name:
+            return "note_edit"
+        if "right" in name and "side" in name and "drawer" in name:
+            return "right_side_drawer"
+        if "revision" in name:
+            return "revision"
         if "pickup" in name and "card" in name:
             return "pickup_card"
         if "drop" in name and "card" in name:
