@@ -8,6 +8,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -44,8 +45,8 @@ class VideoPreviewDialog(QDialog):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.audio_output.setVolume(0.75)
-        self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
+        self._outputs_attached = False
+        self._attach_outputs()
 
         self.play_button = QPushButton("Pause")
         self.play_button.clicked.connect(self._toggle_playback)
@@ -121,8 +122,16 @@ class VideoPreviewDialog(QDialog):
 
         self.set_video_path(video_path, autoplay=True)
 
+    def _attach_outputs(self) -> None:
+        if self._outputs_attached:
+            return
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+        self._outputs_attached = True
+
     def set_video_path(self, video_path: Path, *, autoplay: bool = True) -> None:
-        self.player.stop()
+        self.release_media()
+        self._attach_outputs()
         self.video_path = video_path
         label = "Raw" if self.video_kind == "raw" else "Edited"
         self.setWindowTitle(f"{label} Preview - {video_path.name}")
@@ -130,12 +139,51 @@ class VideoPreviewDialog(QDialog):
         self.position_slider.setValue(0)
         self.position_slider.setRange(0, 0)
         self.time_label.setText("00:00 / 00:00")
+        self.audio_output.setMuted(False)
+        self.audio_output.setVolume(max(0, min(self.volume_slider.value(), 100)) / 100)
         self.player.setSource(QUrl.fromLocalFile(str(video_path)))
         if autoplay:
             self.player.play()
 
+    def release_media(self) -> None:
+        if not hasattr(self, "player"):
+            return
+        for action in (
+            self.player.stop,
+            lambda: self.player.setSource(QUrl()),
+            lambda: self.player.setVideoOutput(None),
+            lambda: self.player.setAudioOutput(None),
+        ):
+            try:
+                action()
+            except (RuntimeError, TypeError):
+                pass
+        self._outputs_attached = False
+        if hasattr(self, "audio_output"):
+            for action in (
+                lambda: self.audio_output.setMuted(True),
+                lambda: self.audio_output.setVolume(0.0),
+            ):
+                try:
+                    action()
+                except RuntimeError:
+                    pass
+        self._duration = 0
+        self._seeking = False
+        self.play_button.setText("Play")
+        self.position_slider.setRange(0, 0)
+        self.position_slider.setValue(0)
+        self.time_label.setText("00:00 / 00:00")
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def done(self, result: int) -> None:
+        self.release_media()
+        super().done(result)
+
     def closeEvent(self, event) -> None:
-        self.player.stop()
+        self.release_media()
         super().closeEvent(event)
 
     def _toggle_playback(self) -> None:

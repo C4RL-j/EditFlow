@@ -29,6 +29,7 @@ from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractButton,
+    QButtonGroup,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -76,14 +78,19 @@ from models.project import (
     workflow_move_block_reason,
     workflow_stage_label,
 )
+from ui.asset_preview_panel import AssetPreviewPanel
+from ui.asset_quick_preview_dialog import AssetQuickPreviewDialog
 from ui.asset_widgets import (
     ASSET_ID_ROLE,
     ASSET_PATH_ROLE,
     ASSET_TYPE_ROLE,
     AssetLibraryTree,
-    AssetListWidget,
 )
+from ui.icons import ASSET_ICON_SIZE, EDITFLOW_DANGER_COLOR, editflow_icon
 from ui.dialogs import (
+    AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
     AddRawVideoDialog,
     AssetDialog,
     AssetPickerDialog,
@@ -174,7 +181,8 @@ class MainWindow(QMainWindow):
         self.loading_hide_timer.timeout.connect(self._hide_loading_now)
         self.toast_hide_timer = QTimer(self)
         self.toast_hide_timer.setSingleShot(True)
-        self.toast_hide_timer.timeout.connect(lambda: self.toast_label.setVisible(False))
+        self.toast_hide_timer.timeout.connect(self._hide_toast)
+        self._modal_focus_dialog_depth = 0
 
         self.setWindowTitle("EditFlow")
         self._apply_window_icon()
@@ -252,6 +260,7 @@ class MainWindow(QMainWindow):
         self._details_expanded = False
         self.details.setParent(self.content_widget)
         self.details.installEventFilter(self)
+        self.details.collapse_button.installEventFilter(self)
         self.details.setMouseTracking(True)
         self.details.set_collapsed(True)
         self.details.show()
@@ -272,7 +281,13 @@ class MainWindow(QMainWindow):
         shell_layout.addWidget(self.content_widget, 1)
 
         self.setCentralWidget(shell)
+        self.modal_focus_overlay = QFrame(shell)
+        self.modal_focus_overlay.setObjectName("ModalFocusOverlay")
+        self.modal_focus_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.modal_focus_overlay.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.modal_focus_overlay.setVisible(False)
         self.setStyleSheet(STYLESHEET)
+        self._position_modal_focus_overlay()
         self._position_details_overlay(animated=False)
         self.refresh_projects()
         self.refresh_dashboard()
@@ -356,6 +371,7 @@ class MainWindow(QMainWindow):
         self.board.assets_dropped.connect(self._handle_assets_dropped_on_project)
         self.board.video_preview_requested.connect(self._preview_video)
         self.board.edited_video_requested.connect(self._select_edited_video)
+        self.board.edited_video_dropped.connect(self._handle_edited_video_dropped)
         self.board.open_folder_requested.connect(self._open_project_folder)
         self.board.copy_folder_path_requested.connect(self._copy_project_folder_path)
         self.board.priority_toggle_requested.connect(self._toggle_project_priority)
@@ -449,6 +465,10 @@ class MainWindow(QMainWindow):
         self.publish_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.publish_table.customContextMenuRequested.connect(
             self._show_published_table_context_menu
+        )
+        self.publish_table.cellClicked.connect(self._handle_published_table_cell_clicked)
+        self.publish_table.cellDoubleClicked.connect(
+            self._handle_published_table_cell_double_clicked
         )
         self.publish_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.publish_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -547,7 +567,13 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._position_details_overlay(animated=False)
         self._position_loading_panel()
+        self._position_modal_focus_overlay()
         self._position_toast()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "assets_preview_panel"):
+            self.assets_preview_panel.release_media()
+        super().closeEvent(event)
 
     def eventFilter(self, watched, event) -> bool:
         if event.type() == QEvent.Type.MouseButtonPress and self._should_play_click_sound(watched, event):
@@ -557,12 +583,19 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.Resize:
                 self._position_details_overlay(animated=False)
                 self._position_loading_panel()
+                self._position_modal_focus_overlay()
                 self._position_toast()
         if hasattr(self, "details") and watched == self.details:
-            if event.type() == QEvent.Type.Enter:
-                self._expand_details_overlay()
+            if event.type() == QEvent.Type.Enter and self._details_expanded:
+                self.details_collapse_timer.stop()
             elif event.type() == QEvent.Type.Leave:
                 self._schedule_details_collapse()
+        if (
+            hasattr(self, "details")
+            and watched == self.details.collapse_button
+            and event.type() == QEvent.Type.Enter
+        ):
+            self._expand_details_overlay()
         return super().eventFilter(watched, event)
 
     def _details_overlay_allowed(self) -> bool:
@@ -783,6 +816,70 @@ class MainWindow(QMainWindow):
         self._earnings_animation_running = False
         self._play_next_earnings_animation()
 
+    def _position_modal_focus_overlay(self) -> None:
+        if not hasattr(self, "modal_focus_overlay"):
+            return
+        parent = self.modal_focus_overlay.parentWidget()
+        if parent is None:
+            return
+        self.modal_focus_overlay.setGeometry(parent.rect())
+        if self.modal_focus_overlay.isVisible():
+            self.modal_focus_overlay.raise_()
+
+    def _show_modal_focus_overlay(self) -> None:
+        self._position_modal_focus_overlay()
+        self.modal_focus_overlay.setVisible(True)
+        self.modal_focus_overlay.raise_()
+        self.modal_focus_overlay.setFocus(Qt.FocusReason.PopupFocusReason)
+        QApplication.processEvents()
+
+    def _hide_modal_focus_overlay(self) -> None:
+        if not hasattr(self, "modal_focus_overlay"):
+            return
+        if self._modal_focus_dialog_depth:
+            return
+        self.modal_focus_overlay.setVisible(False)
+
+    def _exec_focused_message_box(self, box: QMessageBox) -> int:
+        return self._exec_focused_dialog(box)
+
+    def _exec_focused_dialog(self, dialog) -> int:
+        self._modal_focus_dialog_depth += 1
+        self._show_modal_focus_overlay()
+        try:
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dialog.raise_()
+            dialog.activateWindow()
+            return dialog.exec()
+        finally:
+            self._modal_focus_dialog_depth = max(0, self._modal_focus_dialog_depth - 1)
+            self._hide_modal_focus_overlay()
+
+    def _focused_warning(self, title: str, message: str) -> QMessageBox.StandardButton:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        return QMessageBox.StandardButton(self._exec_focused_message_box(box))
+
+    def _focused_critical(self, title: str, message: str) -> QMessageBox.StandardButton:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        return QMessageBox.StandardButton(self._exec_focused_message_box(box))
+
+    def _focused_question(self, title: str, message: str) -> QMessageBox.StandardButton:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        return QMessageBox.StandardButton(self._exec_focused_message_box(box))
+
     def _position_loading_panel(self) -> None:
         if not hasattr(self, "loading_panel") or not hasattr(self, "content_widget"):
             return
@@ -792,8 +889,9 @@ class MainWindow(QMainWindow):
     def _position_toast(self) -> None:
         if not hasattr(self, "toast_label") or not hasattr(self, "content_widget"):
             return
+        container = self.toast_label.parentWidget() or self.content_widget
         self.toast_label.adjustSize()
-        board_width = self.board.width() if hasattr(self, "board") else self.content_widget.width()
+        board_width = self.board.width() if hasattr(self, "board") else container.width()
         max_width = min(360, max(220, board_width - 40))
         self.toast_label.setMaximumWidth(max_width)
         self.toast_label.adjustSize()
@@ -805,15 +903,15 @@ class MainWindow(QMainWindow):
             and self.stack.currentWidget() == self.projects_page
             and self.board.isVisible()
         ):
-            board_top_left = self.board.mapTo(self.content_widget, QPoint(0, 0))
+            board_top_left = container.mapFromGlobal(self.board.mapToGlobal(QPoint(0, 0)))
             x = board_top_left.x() + (self.board.width() - self.toast_label.width()) // 2
-            x = max(18, min(x, self.content_widget.width() - self.toast_label.width() - 18))
+            x = max(18, min(x, container.width() - self.toast_label.width() - 18))
             y = board_top_left.y() - self.toast_label.height() - 8
             if y < 18:
                 y = board_top_left.y() + 10
             self.toast_label.move(x, y)
         else:
-            x = (self.content_widget.width() - self.toast_label.width()) // 2
+            x = (container.width() - self.toast_label.width()) // 2
             self.toast_label.move(max(18, x), 18)
         self.toast_label.raise_()
 
@@ -879,100 +977,574 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_assets_page(self) -> QWidget:
-        self.asset_search_edit = QLineEdit()
-        self.asset_search_edit.setPlaceholderText("🔍 Search assets, folders, clients, tags...")
-        self.asset_search_edit.textChanged.connect(lambda _text: self.refresh_assets())
-
-        import_files_button = QPushButton("📄 Files")
-        import_files_button.setToolTip("Import Files")
-        import_files_button.clicked.connect(self._import_asset_files)
-
-        import_folder_button = QPushButton("📁 Folder")
-        import_folder_button.setToolTip("Import Folder")
-        import_folder_button.clicked.connect(self._import_asset_folder)
-
-        new_folder_button = QPushButton("📁 Folder")
-        new_folder_button.setToolTip("New Folder")
-        new_folder_button.clicked.connect(self._new_asset_folder)
-
-        rename_button = QPushButton("Rename")
-        rename_button.clicked.connect(self._rename_selected_asset)
-
-        move_button = QPushButton("Move")
-        move_button.clicked.connect(self._move_selected_assets)
-
-        delete_button = QPushButton("Delete")
-        delete_button.clicked.connect(self._delete_selected_assets)
-
-        open_button = QPushButton("📁 Explorer")
-        open_button.setToolTip("Open in Explorer")
-        open_button.clicked.connect(self._open_selected_asset_location)
-
-        edit_tags_button = QPushButton("🏷 Tags")
-        edit_tags_button.clicked.connect(self._edit_selected_asset_tags)
-
-        title = QLabel("📦 Assets")
-        title.setObjectName("PageTitle")
+        self._asset_restoring_layout = False
+        self._asset_by_id: dict[int, Asset] = {}
+        self._asset_tag_map: dict[int, list[str]] = {}
+        self._asset_usage_counts: dict[int, int] = {}
+        self._asset_favorite_ids: set[int] = set()
+        self._asset_preview_order: list[int] = []
+        self._asset_browse_folder_path: Path | None = None
+        self._asset_folder_history: list[Path] = []
+        title = QPushButton("Assets")
+        title.setObjectName("PageTitleButton")
+        title.setIcon(editflow_icon("library"))
+        title.setIconSize(QSize(22, 22))
+        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        title.setToolTip("Open EditFlow Assets directory")
+        title.clicked.connect(self._open_assets_library_root)
         subtitle = QLabel("Managed EditFlow Asset Library. Drag assets or folders onto project cards to link them.")
         subtitle.setObjectName("MutedLabel")
-        self.asset_library_root_label = QLabel()
-        self.asset_library_root_label.setObjectName("PathLabel")
-        self.asset_library_root_label.setWordWrap(True)
+        self.asset_search_edit = QLineEdit()
+        self.asset_search_edit.setPlaceholderText("Search assets, folders, categories, tags...")
+        self.asset_search_edit.textChanged.connect(lambda _text: self.refresh_assets())
+
+        import_files_button = QPushButton("Import Files")
+        import_files_button.clicked.connect(self._import_asset_files)
+        import_folder_button = QPushButton("Import Folder")
+        import_folder_button.setIcon(editflow_icon("folder"))
+        import_folder_button.setIconSize(ASSET_ICON_SIZE)
+        import_folder_button.clicked.connect(self._import_asset_folder)
+        new_folder_button = QPushButton("New Folder")
+        new_folder_button.setIcon(editflow_icon("folder"))
+        new_folder_button.setIconSize(ASSET_ICON_SIZE)
+        new_folder_button.clicked.connect(self._new_asset_folder)
+
+        more_button = QPushButton("...")
+        more_button.setToolTip("More asset actions")
+        more_menu = QMenu(more_button)
+        for label, slot in (
+            ("Rename", self._rename_selected_asset),
+            ("Move", self._move_selected_assets),
+            ("Delete", self._delete_selected_assets),
+            ("Tags", self._edit_selected_asset_tags),
+            ("Favorite / Unfavorite", self._toggle_selected_asset_favorite),
+            ("Open in Explorer", self._open_selected_asset_location),
+        ):
+            action = more_menu.addAction(self._asset_action_icon(label), label)
+            action.triggered.connect(slot)
+            if label == "Delete":
+                more_menu.addSeparator()
+        more_button.setMenu(more_menu)
 
         top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
         top_row.addWidget(self.asset_search_edit, 1)
-        top_row.addWidget(edit_tags_button)
-        top_row.addWidget(open_button)
-        top_row.addWidget(rename_button)
-        top_row.addWidget(move_button)
-        top_row.addWidget(delete_button)
-        top_row.addWidget(new_folder_button)
         top_row.addWidget(import_files_button)
         top_row.addWidget(import_folder_button)
+        top_row.addWidget(new_folder_button)
+        top_row.addWidget(more_button)
 
-        recent_title = QLabel("🕘 Recent Assets")
-        recent_title.setObjectName("SectionTitle")
-        self.recent_assets_list = AssetListWidget()
-        self.recent_assets_list.setMaximumHeight(120)
-        self.recent_assets_list.setViewMode(self.recent_assets_list.ViewMode.IconMode)
-        self.recent_assets_list.setIconSize(QSize(96, 54))
+        self.asset_filter_group = QButtonGroup(self)
+        self.asset_filter_group.setExclusive(True)
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(6)
+        filter_row.addWidget(QLabel("Library"))
+        for filter_name in ("All", "Favorites", "Recent", "Most Used"):
+            button = QPushButton(filter_name)
+            button.setObjectName("PickerFilterButton")
+            button.setCheckable(True)
+            if filter_name == "Favorites":
+                button.setIcon(editflow_icon("star", filled=True))
+                button.setIconSize(ASSET_ICON_SIZE)
+            button.clicked.connect(lambda _checked=False, value=filter_name: self._set_asset_source_filter(value))
+            self.asset_filter_group.addButton(button)
+            filter_row.addWidget(button)
+        filter_row.addStretch(1)
+        saved_filter = self.project_service.get_setting("assets_source_filter", "All")
+        self._set_checked_asset_source_filter(saved_filter if saved_filter in {"All", "Favorites", "Recent", "Most Used"} else "All")
 
-        most_used_title = QLabel("📌 Most Used Assets")
-        most_used_title.setObjectName("SectionTitle")
-        self.most_used_assets_list = AssetListWidget()
-        self.most_used_assets_list.setMaximumHeight(120)
-        self.most_used_assets_list.setViewMode(self.most_used_assets_list.ViewMode.IconMode)
-        self.most_used_assets_list.setIconSize(QSize(96, 54))
+        self.asset_type_filter_group = QButtonGroup(self)
+        self.asset_type_filter_group.setExclusive(True)
+        type_filter_row = QHBoxLayout()
+        type_filter_row.setContentsMargins(0, 0, 0, 0)
+        type_filter_row.setSpacing(6)
+        type_filter_row.addWidget(QLabel("Type"))
+        for type_filter in ("All Types", "Images", "Video", "Audio", "Folders"):
+            button = QPushButton(type_filter)
+            button.setObjectName("PickerFilterButton")
+            button.setCheckable(True)
+            if type_filter == "Folders":
+                button.setIcon(editflow_icon("folder"))
+                button.setIconSize(ASSET_ICON_SIZE)
+            button.clicked.connect(lambda _checked=False, value=type_filter: self._set_asset_type_filter(value))
+            self.asset_type_filter_group.addButton(button)
+            type_filter_row.addWidget(button)
+        type_filter_row.addStretch(1)
+        saved_type_filter = self.project_service.get_setting("assets_type_filter", "All Types")
+        self._set_checked_asset_type_filter(saved_type_filter if saved_type_filter in {"All Types", "Images", "Video", "Audio", "Folders"} else "All Types")
+
+        self.asset_back_button = QPushButton("Back")
+        self.asset_back_button.setObjectName("BreadcrumbBackButton")
+        self.asset_back_button.clicked.connect(self._go_back_asset_folder)
+        self.asset_breadcrumb_widget = QWidget()
+        self.asset_breadcrumb_widget.setObjectName("AssetBreadcrumbBar")
+        self.asset_breadcrumb_layout = QHBoxLayout(self.asset_breadcrumb_widget)
+        self.asset_breadcrumb_layout.setContentsMargins(0, 0, 0, 0)
+        self.asset_breadcrumb_layout.setSpacing(2)
+        breadcrumb_row = QHBoxLayout()
+        breadcrumb_row.setContentsMargins(0, 0, 0, 0)
+        breadcrumb_row.setSpacing(6)
+        breadcrumb_row.addWidget(self.asset_back_button)
+        breadcrumb_row.addWidget(self.asset_breadcrumb_widget, 1)
 
         self.assets_tree = AssetLibraryTree()
-        self.assets_tree.setColumnCount(7)
-        self.assets_tree.setHeaderLabels(
-            ["Name", "Type", "Client", "Category", "Tags", "Path", "ID"]
-        )
-        self.assets_tree.setColumnHidden(6, True)
+        self.assets_tree.setColumnCount(5)
+        self.assets_tree.setHeaderLabels(["Name", "Type", "Category", "Tags", "ID"])
+        self.assets_tree.setColumnHidden(4, True)
         self.assets_tree.setEditTriggers(AssetLibraryTree.EditTrigger.NoEditTriggers)
-        self.assets_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.assets_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.assets_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.assets_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.assets_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.assets_tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.assets_tree.setSortingEnabled(True)
+        self.assets_tree.setIconSize(ASSET_ICON_SIZE)
+        self.assets_tree.setExpandsOnDoubleClick(False)
+        self.assets_tree.itemSelectionChanged.connect(self._update_asset_preview_from_selection)
+        self.assets_tree.currentItemChanged.connect(lambda current, _previous: self._remember_assets_current_folder(current))
+        self.assets_tree.itemDoubleClicked.connect(self._handle_asset_tree_double_clicked)
+        self.assets_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.assets_tree.customContextMenuRequested.connect(self._show_asset_tree_context_menu)
         self.assets_tree.assets_moved.connect(self._move_assets_to_folder)
+        self.assets_tree.external_paths_dropped.connect(self._import_dropped_asset_paths)
+
+        header = self.assets_tree.header()
+        header.setStretchLastSection(False)
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        header.sectionResized.connect(lambda _logical, _old_size, _new_size: self._save_assets_column_widths())
+        header.sortIndicatorChanged.connect(lambda _column, _order: self._save_assets_sort_state())
+
+        self.assets_preview_toggle_button = QPushButton("Hide Preview")
+        self.assets_preview_toggle_button.clicked.connect(self._toggle_assets_preview_panel)
+        library_title = QLabel("Asset Library")
+        library_title.setObjectName("SectionTitle")
+        library_title_row = QHBoxLayout()
+        library_title_row.setContentsMargins(0, 0, 0, 0)
+        library_title_row.addWidget(library_title)
+        library_title_row.addStretch(1)
+        library_title_row.addWidget(self.assets_preview_toggle_button)
+        library_layout = QVBoxLayout()
+        library_layout.setContentsMargins(0, 0, 0, 0)
+        library_layout.setSpacing(8)
+        library_layout.addLayout(library_title_row)
+        library_layout.addWidget(self.assets_tree, 1)
+        library_widget = QWidget()
+        library_widget.setLayout(library_layout)
+
+        self.assets_preview_panel = AssetPreviewPanel()
+        self.assets_preview_panel.quick_preview_requested.connect(self._open_current_asset_quick_preview)
+        self.assets_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.assets_splitter.setChildrenCollapsible(True)
+        self.assets_splitter.addWidget(library_widget)
+        self.assets_splitter.addWidget(self.assets_preview_panel)
+        self.assets_splitter.setStretchFactor(0, 5)
+        self.assets_splitter.setStretchFactor(1, 1)
+        self.assets_splitter.splitterMoved.connect(lambda _position, _index: self._save_assets_splitter_sizes())
+        self._restore_assets_layout_state()
 
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(16)
-        layout.addLayout(top_row)
+        layout.setSpacing(12)
         layout.addWidget(title)
         layout.addWidget(subtitle)
-        layout.addWidget(self.asset_library_root_label)
-        layout.addWidget(self.assets_tree, 1)
-        layout.addWidget(recent_title)
-        layout.addWidget(self.recent_assets_list)
-        layout.addWidget(most_used_title)
-        layout.addWidget(self.most_used_assets_list)
+        layout.addLayout(top_row)
+        layout.addLayout(filter_row)
+        layout.addLayout(type_filter_row)
+        layout.addLayout(breadcrumb_row)
+        layout.addWidget(self.assets_splitter, 1)
         return page
+
+    def _setting_int(self, key: str, default: int = 0) -> int:
+        try:
+            return int(self.project_service.get_setting(key, str(default)))
+        except ValueError:
+            return default
+
+    def _restore_assets_layout_state(self) -> None:
+        self._asset_restoring_layout = True
+        try:
+            widths: list[int] = []
+            for value in self.project_service.get_setting("assets_column_widths", "").split(","):
+                try:
+                    widths.append(int(value.strip()))
+                except ValueError:
+                    continue
+            if len(widths) != 4:
+                widths = [360, 90, 140, 240]
+            for column, width in enumerate(widths[:4]):
+                self.assets_tree.setColumnWidth(column, max(48, width))
+
+            sort_column = max(0, min(self._setting_int("assets_sort_column", 0), 3))
+            sort_order = Qt.SortOrder.DescendingOrder if self.project_service.get_setting("assets_sort_order", "asc") == "desc" else Qt.SortOrder.AscendingOrder
+            self.assets_tree.header().setSortIndicator(sort_column, sort_order)
+            self.assets_tree.sortItems(sort_column, sort_order)
+
+            visible = self.project_service.get_setting("assets_preview_visible", "1") != "0"
+            self.assets_preview_panel.setVisible(visible)
+            self.assets_preview_toggle_button.setText("Hide Preview" if visible else "Show Preview")
+            sizes: list[int] = []
+            for value in self.project_service.get_setting("assets_splitter_sizes", "").split(","):
+                try:
+                    sizes.append(int(value.strip()))
+                except ValueError:
+                    continue
+            if len(sizes) != 2:
+                sizes = [820, 260] if visible else [1080, 0]
+            self.assets_splitter.setSizes(sizes)
+        finally:
+            self._asset_restoring_layout = False
+
+    def _save_assets_column_widths(self) -> None:
+        if getattr(self, "_asset_restoring_layout", False) or not hasattr(self, "assets_tree"):
+            return
+        self.project_service.set_setting("assets_column_widths", ",".join(str(self.assets_tree.columnWidth(column)) for column in range(4)))
+
+    def _save_assets_sort_state(self) -> None:
+        if getattr(self, "_asset_restoring_layout", False) or not hasattr(self, "assets_tree"):
+            return
+        header = self.assets_tree.header()
+        self.project_service.set_setting("assets_sort_column", str(header.sortIndicatorSection()))
+        self.project_service.set_setting("assets_sort_order", "desc" if header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder else "asc")
+
+    def _save_assets_splitter_sizes(self) -> None:
+        if getattr(self, "_asset_restoring_layout", False) or not hasattr(self, "assets_splitter"):
+            return
+        self.project_service.set_setting("assets_splitter_sizes", ",".join(str(size) for size in self.assets_splitter.sizes()))
+        self.project_service.set_setting("assets_preview_visible", "1" if not self.assets_preview_panel.isHidden() else "0")
+
+    def _toggle_assets_preview_panel(self) -> None:
+        visible = self.assets_preview_panel.isHidden()
+        self.assets_preview_panel.setVisible(visible)
+        self.assets_preview_toggle_button.setText("Hide Preview" if visible else "Show Preview")
+        if visible and (not self.assets_splitter.sizes() or self.assets_splitter.sizes()[-1] < 80):
+            self.assets_splitter.setSizes([820, 260])
+        if not visible:
+            self.assets_preview_panel.release_media()
+        self._save_assets_splitter_sizes()
+
+    def _current_asset_source_filter(self) -> str:
+        checked = self.asset_filter_group.checkedButton() if hasattr(self, "asset_filter_group") else None
+        return checked.text() if checked is not None else "All"
+
+    def _set_asset_source_filter(self, filter_name: str) -> None:
+        self.project_service.set_setting("assets_source_filter", filter_name)
+        self.refresh_assets()
+
+    def _set_checked_asset_source_filter(self, filter_name: str) -> None:
+        if not hasattr(self, "asset_filter_group"):
+            return
+        for button in self.asset_filter_group.buttons():
+            button.setChecked(button.text() == filter_name)
+
+    def _current_asset_type_filter(self) -> str:
+        checked = self.asset_type_filter_group.checkedButton() if hasattr(self, "asset_type_filter_group") else None
+        return checked.text() if checked is not None else "All Types"
+
+    def _set_asset_type_filter(self, filter_name: str) -> None:
+        self.project_service.set_setting("assets_type_filter", filter_name)
+        self.refresh_assets()
+
+    def _set_checked_asset_type_filter(self, filter_name: str) -> None:
+        if not hasattr(self, "asset_type_filter_group"):
+            return
+        for button in self.asset_type_filter_group.buttons():
+            button.setChecked(button.text() == filter_name)
+
+    def _asset_matches_type_filter(self, asset: Asset, filter_name: str) -> bool:
+        if filter_name == "All Types":
+            return True
+        if filter_name == "Folders":
+            return asset.is_collection
+        if asset.is_collection:
+            return False
+        suffix = asset.file_path.suffix.casefold()
+        if filter_name == "Images":
+            return suffix in IMAGE_EXTENSIONS
+        if filter_name == "Video":
+            return suffix in VIDEO_EXTENSIONS
+        if filter_name == "Audio":
+            return suffix in AUDIO_EXTENSIONS
+        return True
+
+    def _asset_kind(self, asset: Asset) -> str:
+        if asset.is_collection:
+            return "Folder"
+        suffix = asset.file_path.suffix.casefold()
+        if suffix in IMAGE_EXTENSIONS:
+            return "Image"
+        if suffix in VIDEO_EXTENSIONS:
+            return "Video"
+        if suffix in AUDIO_EXTENSIONS:
+            return "Audio"
+        return "File"
+
+    def _asset_display_name(self, asset: Asset) -> str:
+        return asset.name
+
+    def _asset_action_icon(self, label: str, *, favorite: bool | None = None) -> QIcon:
+        action = label.casefold()
+        if "preview" in action:
+            return editflow_icon("preview")
+        if "favorite" in action:
+            return editflow_icon("star", filled=bool(favorite))
+        if "rename" in action:
+            return editflow_icon("rename")
+        if "move" in action:
+            return editflow_icon("move")
+        if "tag" in action:
+            return editflow_icon("tag")
+        if "explorer" in action or "folder" in action:
+            return editflow_icon("folder")
+        if "delete" in action:
+            return editflow_icon("trash", color=EDITFLOW_DANGER_COLOR)
+        return QIcon()
+
+    def _include_asset_ancestors(self, visible_ids: set[int], assets_by_path: dict[str, Asset], asset_root: Path) -> None:
+        for asset in list(assets_by_path.values()):
+            if asset.id not in visible_ids:
+                continue
+            parent = asset.file_path.parent
+            while parent != asset_root and parent != parent.parent:
+                parent_asset = assets_by_path.get(normalize_file_path(parent))
+                if parent_asset is not None and parent_asset.id is not None:
+                    visible_ids.add(parent_asset.id)
+                parent = parent.parent
+
+    def _asset_browse_root(self, asset_root: Path) -> Path:
+        browse_root = self._asset_browse_folder_path
+        if browse_root is None:
+            saved_folder = self.project_service.get_setting("assets_browse_folder", "")
+            browse_root = Path(saved_folder) if saved_folder else asset_root
+        if not _is_under_path(browse_root, asset_root) or not browse_root.exists() or not browse_root.is_dir():
+            browse_root = asset_root
+        self._asset_browse_folder_path = browse_root
+        return browse_root
+
+    def _asset_browse_target(self, folder: Path, asset_root: Path) -> Path:
+        target = folder if _is_under_path(folder, asset_root) else asset_root
+        if not target.exists() or not target.is_dir():
+            target = asset_root
+        return target
+
+    def _set_asset_browse_folder(self, folder: Path, *, remember_history: bool = True) -> None:
+        asset_root = self.project_service.asset_library_root()
+        target = self._asset_browse_target(folder, asset_root)
+        current = self._asset_browse_root(asset_root)
+        if current.resolve(strict=False) == target.resolve(strict=False):
+            return
+        if remember_history:
+            self._asset_folder_history.append(current)
+        self._asset_browse_folder_path = target
+        self.project_service.set_setting("assets_browse_folder", str(target))
+        self.project_service.set_setting("assets_last_folder", str(target))
+        self.refresh_assets()
+
+    def _go_back_asset_folder(self) -> None:
+        asset_root = self.project_service.asset_library_root()
+        current = self._asset_browse_root(asset_root).resolve(strict=False)
+        while self._asset_folder_history:
+            previous = self._asset_browse_target(self._asset_folder_history.pop(), asset_root)
+            if previous.resolve(strict=False) != current:
+                self._set_asset_browse_folder(previous, remember_history=False)
+                return
+        self._update_asset_folder_nav(asset_root, self._asset_browse_root(asset_root))
+
+    def _go_to_asset_parent_folder(self) -> None:
+        asset_root = self.project_service.asset_library_root()
+        current = self._asset_browse_root(asset_root)
+        if current.resolve(strict=False) == asset_root.resolve(strict=False):
+            return
+        parent = current.parent
+        self._set_asset_browse_folder(parent if _is_under_path(parent, asset_root) else asset_root)
+
+    def _update_asset_folder_nav(self, asset_root: Path, browse_root: Path) -> None:
+        if not hasattr(self, "asset_breadcrumb_layout") or not hasattr(self, "asset_back_button"):
+            return
+        self.asset_back_button.setEnabled(bool(self._asset_folder_history))
+        while self.asset_breadcrumb_layout.count():
+            child = self.asset_breadcrumb_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        segments: list[tuple[str, Path]] = [("Assets", asset_root)]
+        try:
+            relative_parts = browse_root.relative_to(asset_root).parts
+        except ValueError:
+            relative_parts = ()
+        current_path = asset_root
+        for part in relative_parts:
+            current_path = current_path / part
+            segments.append((part, current_path))
+
+        for index, (label, folder) in enumerate(segments):
+            is_current = index == len(segments) - 1
+            button = QPushButton(label)
+            button.setObjectName("BreadcrumbButton")
+            button.setProperty("current", "true" if is_current else "false")
+            button.clicked.connect(lambda _checked=False, path=folder: self._set_asset_browse_folder(path))
+            self.asset_breadcrumb_layout.addWidget(button)
+            if not is_current:
+                separator = QLabel(">")
+                separator.setObjectName("BreadcrumbSeparator")
+                self.asset_breadcrumb_layout.addWidget(separator)
+        self.asset_breadcrumb_layout.addStretch(1)
+
+    def _remember_assets_current_folder(self, item: QTreeWidgetItem | None) -> None:
+        if item is None:
+            return
+        path_value = item.data(0, ASSET_PATH_ROLE)
+        type_value = item.data(0, ASSET_TYPE_ROLE)
+        if not isinstance(path_value, str):
+            return
+        path = Path(path_value)
+        folder = path if type_value == "folder" else path.parent
+        self.project_service.set_setting("assets_last_folder", str(folder))
+
+    def _restore_assets_last_folder_item(self, items_by_path: dict[str, QTreeWidgetItem]) -> None:
+        last_folder = self.project_service.get_setting("assets_last_folder", "")
+        if not last_folder or self.assets_tree.selectedItems():
+            return
+        item = items_by_path.get(normalize_file_path(Path(last_folder)))
+        if item is not None:
+            self.assets_tree.setCurrentItem(item)
+            self.assets_tree.scrollToItem(item)
+
+    def _handle_asset_tree_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        if item.data(0, ASSET_TYPE_ROLE) == "folder":
+            path_value = item.data(0, ASSET_PATH_ROLE)
+            if isinstance(path_value, str):
+                self._set_asset_browse_folder(Path(path_value))
+            return
+        value = item.data(0, ASSET_ID_ROLE)
+        self._open_asset_quick_preview(value if isinstance(value, int) else None)
+
+    def _quick_preview_assets(self) -> list[Asset]:
+        assets: list[Asset] = []
+        seen: set[int] = set()
+        for asset_id in self._asset_preview_order:
+            asset = self._asset_by_id.get(asset_id)
+            if asset is None or asset.is_collection or asset_id in seen:
+                continue
+            seen.add(asset_id)
+            assets.append(asset)
+        return assets
+
+    def _open_current_asset_quick_preview(self) -> None:
+        if not hasattr(self, "assets_tree"):
+            return
+        self._open_asset_quick_preview(self.assets_tree.current_asset_id())
+
+    def _open_asset_quick_preview(self, asset_id: int | None) -> None:
+        if asset_id is None:
+            return
+        asset = self._asset_by_id.get(asset_id) or self.project_service.get_asset(asset_id)
+        if asset is None or asset.is_collection:
+            return
+        if hasattr(self, "assets_preview_panel"):
+            self.assets_preview_panel.release_media()
+        assets = self._quick_preview_assets()
+        if not any(item.id == asset_id for item in assets):
+            assets = [asset]
+        dialog = AssetQuickPreviewDialog(assets, asset_id, self, autoplay_media=True)
+        dialog.exec()
+
+    def _asset_from_tree_item(self, item: QTreeWidgetItem | None) -> Asset | None:
+        if item is None:
+            return None
+        value = item.data(0, ASSET_ID_ROLE)
+        if not isinstance(value, int):
+            return None
+        return self._asset_by_id.get(value) or self.project_service.get_asset(value)
+
+    def _update_asset_preview_from_selection(self, autoplay: bool = False) -> None:
+        if not hasattr(self, "assets_preview_panel"):
+            return
+        self.assets_preview_panel.set_context(self._asset_by_id, self._asset_tag_map, self._asset_favorite_ids, self._asset_usage_counts)
+        self.assets_preview_panel.show_asset_ids(self.assets_tree.selected_asset_ids(), autoplay=autoplay)
+
+    def _restore_asset_selection(self, asset_ids: list[int]) -> None:
+        if not asset_ids or not hasattr(self, "assets_tree"):
+            return
+        wanted = set(asset_ids)
+        first_item = None
+        self.assets_tree.clearSelection()
+        iterator = QTreeWidgetItemIterator(self.assets_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            value = item.data(0, ASSET_ID_ROLE)
+            if isinstance(value, int) and value in wanted:
+                item.setSelected(True)
+                if first_item is None:
+                    first_item = item
+            iterator += 1
+        if first_item is None:
+            self._update_asset_preview_from_selection()
+            return
+        self.assets_tree.setCurrentItem(first_item)
+        self.assets_tree.scrollToItem(first_item)
+        self._update_asset_preview_from_selection()
+
+    def _release_asset_preview_for_assets(self, asset_ids: list[int]) -> bool:
+        if not asset_ids or not hasattr(self, "assets_preview_panel"):
+            return False
+        preview_path = self.assets_preview_panel.current_media_path
+        if preview_path is None:
+            return False
+        preview_path = preview_path.expanduser()
+        for asset_id in asset_ids:
+            asset = self.project_service.get_asset(asset_id)
+            if asset is None:
+                continue
+            asset_path = asset.file_path.expanduser()
+            if asset.is_collection:
+                if _is_under_path(preview_path, asset_path):
+                    self.assets_preview_panel.release_media()
+                    QApplication.processEvents()
+                    return True
+            elif normalize_file_path(preview_path) == normalize_file_path(asset_path):
+                self.assets_preview_panel.release_media()
+                QApplication.processEvents()
+                return True
+        return False
+
+    def _is_windows_file_lock_error(self, error: BaseException) -> bool:
+        checked: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in checked:
+            checked.add(id(current))
+            if getattr(current, "winerror", None) == 32:
+                return True
+            message = str(current).casefold()
+            if "winerror 32" in message or "being used by another process" in message:
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _file_lock_message(self) -> str:
+        return (
+            "EditFlow released the asset preview, but Windows still reports the file is in use. "
+            "Close any other app using the asset and try again."
+        )
+
+    def _run_asset_file_operation(self, title: str, asset_ids: list[int], operation: Callable[[], object]) -> tuple[bool, object | None]:
+        released_preview = self._release_asset_preview_for_assets(asset_ids)
+        try:
+            return True, operation()
+        except Exception as error:
+            if not self._is_windows_file_lock_error(error):
+                QMessageBox.critical(self, title, str(error))
+                return False, None
+            if not released_preview:
+                released_preview = self._release_asset_preview_for_assets(asset_ids)
+            QApplication.processEvents()
+            try:
+                return True, operation()
+            except Exception as retry_error:
+                if self._is_windows_file_lock_error(retry_error):
+                    QMessageBox.critical(self, title, self._file_lock_message())
+                else:
+                    QMessageBox.critical(self, title, str(retry_error))
+                return False, None
 
     def _build_clients_page(self) -> QWidget:
         title = QLabel("👤 Clients")
@@ -1166,6 +1738,8 @@ class MainWindow(QMainWindow):
         }.get(view_name, "Loading projects...")
 
         def switch_view() -> None:
+            if view_name != "assets" and hasattr(self, "assets_preview_panel"):
+                self.assets_preview_panel.release_media()
             if view_name == "dashboard":
                 self.stack.setCurrentWidget(self.dashboard_page)
                 self.refresh_dashboard()
@@ -1279,79 +1853,99 @@ class MainWindow(QMainWindow):
     def refresh_assets(self) -> None:
         self.project_service.sync_asset_library()
         asset_root = self.project_service.asset_library_root()
-        if hasattr(self, "asset_library_root_label"):
-            self.asset_library_root_label.setText(f"Asset Library: {asset_root}")
+        browse_root = self._asset_browse_root(asset_root)
         if hasattr(self, "assets_tree"):
-            self.assets_tree.set_root_path(asset_root)
-
-        assets = self.project_service.list_assets(self.asset_search_edit.text())
-        asset_ids = [asset.id for asset in assets if asset.id is not None]
-        tag_map = self.project_service.list_asset_tag_map(asset_ids)
-        if hasattr(self, "assets_tree"):
-            self._populate_asset_tree(assets, tag_map, asset_root)
-
-        self._refresh_recent_assets()
-        self._refresh_most_used_assets()
-
-    def _populate_asset_tree(
-        self,
-        assets: list[Asset],
-        tag_map: dict[int, list[str]],
-        asset_root: Path,
-    ) -> None:
-        self.assets_tree.clear()
-        items_by_path: dict[str, QTreeWidgetItem] = {}
-        filtered_ids = {asset.id for asset in assets if asset.id is not None}
-        show_filtered = bool(self.asset_search_edit.text().strip())
+            self.assets_tree.set_root_path(browse_root)
+        self._update_asset_folder_nav(asset_root, browse_root)
 
         all_assets = self.project_service.list_assets("")
+        search = self.asset_search_edit.text().strip() if hasattr(self, "asset_search_edit") else ""
+        searched_assets = self.project_service.list_assets(search) if search else all_assets
+        visible_ids = {asset.id for asset in searched_assets if asset.id is not None}
+
+        source_filter = self._current_asset_source_filter() if hasattr(self, "asset_filter_group") else "All"
+        if source_filter == "Favorites":
+            visible_ids &= self.project_service.favorite_asset_ids()
+        elif source_filter == "Recent":
+            visible_ids &= {asset.id for asset in self.project_service.get_recent_assets(limit=500) if asset.id is not None}
+        elif source_filter == "Most Used":
+            visible_ids &= {asset.id for asset, _count in self.project_service.get_most_used_assets(limit=500) if asset.id is not None}
+
+        type_filter = self._current_asset_type_filter() if hasattr(self, "asset_type_filter_group") else "All Types"
+        if type_filter != "All Types":
+            visible_ids &= {
+                asset.id
+                for asset in all_assets
+                if asset.id is not None and self._asset_matches_type_filter(asset, type_filter)
+            }
+
         assets_by_path = {
             normalize_file_path(asset.file_path): asset
             for asset in all_assets
             if asset.id is not None and _is_under_path(asset.file_path, asset_root)
         }
+        browse_ids = {
+            asset.id
+            for asset in all_assets
+            if asset.id is not None
+            and _is_under_path(asset.file_path, browse_root)
+            and asset.file_path.resolve(strict=False) != browse_root.resolve(strict=False)
+        }
+        visible_ids &= browse_ids
+        if search or source_filter != "All" or type_filter != "All Types":
+            self._include_asset_ancestors(visible_ids, assets_by_path, browse_root)
+        else:
+            visible_ids = browse_ids
+
+        visible_assets = [asset for asset in all_assets if asset.id is not None and asset.id in visible_ids]
+        all_asset_ids = [asset.id for asset in all_assets if asset.id is not None]
+        visible_asset_ids = [asset.id for asset in visible_assets if asset.id is not None]
+        self._asset_by_id = {asset.id: asset for asset in all_assets if asset.id is not None}
+        self._asset_tag_map = self.project_service.list_asset_tag_map(visible_asset_ids)
+        self._asset_favorite_ids = self.project_service.favorite_asset_ids()
+        self._asset_usage_counts = self.project_service.asset_usage_counts(all_asset_ids)
+
+        if hasattr(self, "assets_tree"):
+            self._populate_asset_tree(visible_assets, self._asset_tag_map, browse_root)
+            self._update_asset_preview_from_selection()
+
+    def _populate_asset_tree(self, assets: list[Asset], tag_map: dict[int, list[str]], asset_root: Path) -> None:
+        self.assets_tree.clear()
+        items_by_path: dict[str, QTreeWidgetItem] = {}
         ordered_assets = sorted(
-            assets_by_path.values(),
-            key=lambda asset: (
-                len(asset.file_path.parts),
-                not asset.is_collection,
-                str(asset.file_path).casefold(),
-            ),
+            (asset for asset in assets if asset.id is not None and _is_under_path(asset.file_path, asset_root)),
+            key=lambda asset: (len(asset.file_path.parts), not asset.is_collection, str(asset.file_path).casefold()),
         )
-
+        self._asset_preview_order = []
         for asset in ordered_assets:
-            if show_filtered and asset.id not in filtered_ids:
-                continue
-            parent_item = None
-            parent_path = asset.file_path.parent
-            while parent_path != asset_root and parent_path != parent_path.parent:
-                parent_key = normalize_file_path(parent_path)
-                parent_item = items_by_path.get(parent_key)
-                if parent_item is not None:
-                    break
-                parent_path = parent_path.parent
-
-            values = [
-                asset.name,
-                "Folder" if asset.is_collection else "File",
-                asset.client,
-                asset.category,
+            item = QTreeWidgetItem([
+                self._asset_display_name(asset),
+                self._asset_kind(asset),
+                asset.category or "-",
                 ", ".join(tag_map.get(asset.id or 0, [])),
-                str(asset.file_path),
                 str(asset.id or ""),
-            ]
-            item = QTreeWidgetItem(values)
+            ])
             item.setData(0, ASSET_ID_ROLE, asset.id)
             item.setData(0, ASSET_PATH_ROLE, str(asset.file_path))
             item.setData(0, ASSET_TYPE_ROLE, asset.asset_type)
             if asset.is_collection:
-                item.setText(0, f"📁 {asset.name}")
+                item.setIcon(0, editflow_icon("folder"))
             else:
                 cached = self.thumbnail_provider.cached_thumbnail(asset.file_path)
                 if cached is not None:
                     item.setIcon(0, QIcon(str(cached)))
                 self.thumbnail_provider.request(asset.file_path)
+            if asset.id in self._asset_favorite_ids:
+                item.setIcon(1, editflow_icon("star", filled=True))
+                item.setToolTip(1, "Favorite")
 
+            parent_item = None
+            parent_path = asset.file_path.parent
+            while parent_path != asset_root and parent_path != parent_path.parent:
+                parent_item = items_by_path.get(normalize_file_path(parent_path))
+                if parent_item is not None:
+                    break
+                parent_path = parent_path.parent
             if parent_item is None:
                 self.assets_tree.addTopLevelItem(item)
             else:
@@ -1359,30 +1953,23 @@ class MainWindow(QMainWindow):
             items_by_path[normalize_file_path(asset.file_path)] = item
 
         self.assets_tree.expandToDepth(1)
+        self._restore_assets_last_folder_item(items_by_path)
+        header = self.assets_tree.header()
+        self.assets_tree.sortItems(max(0, min(header.sortIndicatorSection(), 3)), header.sortIndicatorOrder())
+        self._asset_preview_order = []
+        iterator = QTreeWidgetItemIterator(self.assets_tree)
+        while iterator.value() is not None:
+            item = iterator.value()
+            value = item.data(0, ASSET_ID_ROLE)
+            if isinstance(value, int) and item.data(0, ASSET_TYPE_ROLE) != "folder":
+                self._asset_preview_order.append(value)
+            iterator += 1
 
     def _refresh_recent_assets(self) -> None:
-        self.recent_assets_list.clear()
-        for asset in self.project_service.get_recent_assets():
-            widget_item = QListWidgetItem(asset.name)
-            widget_item.setToolTip(str(asset.file_path))
-            widget_item.setData(Qt.ItemDataRole.UserRole, asset.id)
-            cached = self.thumbnail_provider.cached_thumbnail(asset.file_path)
-            if cached is not None:
-                widget_item.setIcon(QIcon(str(cached)))
-            self.recent_assets_list.addItem(widget_item)
-            self.thumbnail_provider.request(asset.file_path)
+        pass
 
     def _refresh_most_used_assets(self) -> None:
-        self.most_used_assets_list.clear()
-        for asset, usage_count in self.project_service.get_most_used_assets():
-            widget_item = QListWidgetItem(f"{asset.name}\nUsed {usage_count}x")
-            widget_item.setToolTip(str(asset.file_path))
-            widget_item.setData(Qt.ItemDataRole.UserRole, asset.id)
-            cached = self.thumbnail_provider.cached_thumbnail(asset.file_path)
-            if cached is not None:
-                widget_item.setIcon(QIcon(str(cached)))
-            self.most_used_assets_list.addItem(widget_item)
-            self.thumbnail_provider.request(asset.file_path)
+        pass
 
     def animate_total_earnings(
         self,
@@ -1555,11 +2142,45 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, project)
+                    item.setToolTip("Double-click to open this project folder. Right-click to rename.")
+                if column == 3:
+                    item.setToolTip("Double-click to edit this project earnings amount")
                 if column == 3 and project.earned_amount > 0:
                     item.setForeground(QColor("#35d07f"))
+                if column in {4, 5}:
+                    video_kind = "raw" if column == 4 else "edited"
+                    has_video = (
+                        video_kind == "raw" and project.raw_video_name != "No raw video"
+                    ) or (video_kind == "edited" and project.has_edited_video)
+                    if has_video:
+                        item.setForeground(QColor("#25D7F2"))
+                        font = item.font()
+                        font.setUnderline(True)
+                        item.setFont(font)
+                        item.setToolTip(f"Open {video_kind} video preview")
                 self.publish_table.setItem(row, column, item)
         if projects:
             self.publish_table.selectRow(0)
+
+    def _handle_published_table_cell_clicked(self, row: int, column: int) -> None:
+        if column not in {4, 5}:
+            return
+        project = self._published_project_for_row(row)
+        if project is None:
+            return
+        video_kind = "raw" if column == 4 else "edited"
+        if self._project_video_path(project, video_kind) is None:
+            return
+        self._preview_video(project, video_kind)
+
+    def _handle_published_table_cell_double_clicked(self, row: int, column: int) -> None:
+        project = self._published_project_for_row(row)
+        if project is None:
+            return
+        if column == 0:
+            self._open_project_folder(project)
+        elif column == 3:
+            self._edit_project_payment_amount(project)
 
     def _open_published_root(self) -> None:
         self._open_path(self.project_service.projects_root() / PUBLISHED_STATUS)
@@ -1574,18 +2195,43 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self.publish_table)
-        restore_action = menu.addAction("↩ Restore to Done")
+        rename_action = menu.addAction("Rename Project")
+        restore_action = menu.addAction("Restore to Done")
         selected_action = menu.exec(self.publish_table.viewport().mapToGlobal(position))
-        if selected_action == restore_action:
+        if selected_action == rename_action:
+            self._rename_published_project(project)
+        elif selected_action == restore_action:
             self._restore_selected_published_project()
+
+    def _rename_published_project(self, project: Project) -> None:
+        if project.id is None:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Rename Project",
+            "Project name:",
+            text=project.name,
+        )
+        if not accepted:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == project.name:
+            return
+        try:
+            updated = self.project_service.rename_project(project, new_name)
+        except Exception as error:
+            QMessageBox.critical(self, "Could Not Rename Project", str(error))
+            return
+        self._after_project_changed(updated)
+        self._mark_current_published_earnings_seen()
+        self._show_toast("\u2713 Project renamed")
 
     def _earned_payment_text(self, project: Project) -> str:
         if project.earned_amount <= 0:
             return ""
         return f"${project.earned_amount:.2f}"
 
-    def _selected_published_project(self) -> Project | None:
-        row = self.publish_table.currentRow()
+    def _published_project_for_row(self, row: int) -> Project | None:
         if row < 0:
             return None
         id_item = self.publish_table.item(row, 7)
@@ -1599,6 +2245,9 @@ class MainWindow(QMainWindow):
         if project is None or project.status != PUBLISHED_STATUS:
             return None
         return project
+
+    def _selected_published_project(self) -> Project | None:
+        return self._published_project_for_row(self.publish_table.currentRow())
 
     def refresh_clients(self) -> None:
         if not hasattr(self, "clients_table"):
@@ -1889,8 +2538,7 @@ class MainWindow(QMainWindow):
             if path.exists() and path.is_file() and is_mp4_file(path)
         ]
         if not mp4_paths:
-            QMessageBox.warning(
-                self,
+            self._focused_warning(
                 "No Raw MP4 Found",
                 "Drop one or more MP4 files onto Need Edit.",
             )
@@ -1905,7 +2553,7 @@ class MainWindow(QMainWindow):
         quick_confirm: bool,
     ) -> None:
         dialog = self._raw_video_dialog(raw_path)
-        if dialog.exec() != dialog.DialogCode.Accepted:
+        if self._exec_focused_dialog(dialog) != dialog.DialogCode.Accepted:
             return
 
         values = dialog.values()
@@ -2062,7 +2710,7 @@ class MainWindow(QMainWindow):
 
     def _show_move_blocked(self, reason: str) -> None:
         self._play_sound("drag_failed")
-        self._show_toast(f"Move blocked: {reason}")
+        self._show_toast(f"Move blocked: {reason}", message_type="error")
 
     def _publish_project(self, project: Project) -> None:
         if project.status != "Done":
@@ -2234,7 +2882,11 @@ class MainWindow(QMainWindow):
                 delete_file,
             )
         )
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog.release_media()
+            dialog.deleteLater()
 
     def _project_video_path(self, project: Project, video_kind: str) -> Path | None:
         if video_kind == "raw":
@@ -2266,10 +2918,21 @@ class MainWindow(QMainWindow):
         if not file_name:
             return
 
+        replacement_path = Path(file_name)
+        if video_kind == "edited":
+            action = self._confirm_edited_video_assignment(current, replacement_path)
+            if action == "export":
+                self._add_export_only(current, replacement_path)
+                return
+            if action not in {"continue", "replace"}:
+                return
+
+        dialog.release_media()
+
         def replace() -> Project:
             if video_kind == "raw":
-                return self.project_service.replace_raw_video(current, Path(file_name))
-            return self.project_service.replace_edited_video(current, Path(file_name))
+                return self.project_service.replace_raw_video(current, replacement_path)
+            return self.project_service.replace_edited_video(current, replacement_path)
 
         def handle_success(result: object) -> None:
             updated = result if isinstance(result, Project) else None
@@ -2280,9 +2943,8 @@ class MainWindow(QMainWindow):
             if new_path is not None and new_path.exists():
                 dialog.set_video_path(new_path, autoplay=True)
             self._show_toast("✓ Video file replaced")
-            if video_kind == "edited" and updated.status not in {"Need Upload", "Done"}:
-                answer = QMessageBox.question(
-                    self,
+            if video_kind == "edited" and updated.status not in {"Need Upload", "Done", PUBLISHED_STATUS}:
+                answer = self._focused_question(
                     "Update Status",
                     "Edited video is set. Move this project to Need Upload?",
                 )
@@ -2306,6 +2968,8 @@ class MainWindow(QMainWindow):
         current = self.project_service.get_project(project.id or 0) if project.id else project
         if current is None:
             return
+
+        dialog.release_media()
 
         def remove() -> Project:
             if video_kind == "raw":
@@ -2358,6 +3022,55 @@ class MainWindow(QMainWindow):
         self.refresh_projects()
         self.refresh_activity()
 
+    def _confirm_edited_video_assignment(
+        self,
+        project: Project,
+        video_path: Path,
+    ) -> str | None:
+        current = self.project_service.get_project(project.id or 0) if project.id else project
+        if current is None:
+            return None
+
+        if current.has_edited_video:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Edited Video Exists")
+            box.setText(f"{current.name} already has an edited video.")
+            box.setInformativeText(
+                f"Selected file: {video_path.name}\n\n"
+                "Choose Replace Current to assign this as the current edited video, "
+                "or Add as Another Export to keep the current edited video unchanged."
+            )
+            if current.edited_video_path is not None:
+                box.setDetailedText(f"Current edited video:\n{current.edited_video_path}")
+            replace_button = box.addButton("Replace Current", QMessageBox.ButtonRole.AcceptRole)
+            export_button = box.addButton("Add as Another Export", QMessageBox.ButtonRole.ActionRole)
+            cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(cancel_button)
+            box.setEscapeButton(cancel_button)
+            self._exec_focused_message_box(box)
+            clicked = box.clickedButton()
+            if clicked == replace_button:
+                return "replace"
+            if clicked == export_button:
+                return "export"
+            return None
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Assign Edited Video")
+        box.setText("Set this file as the edited video?")
+        box.setInformativeText(
+            f"Selected file: {video_path.name}\n\n"
+            "EditFlow will import or reference this file using your current edited-video file setting."
+        )
+        cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
+        continue_button = box.addButton("Continue", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(continue_button)
+        box.setEscapeButton(cancel_button)
+        self._exec_focused_message_box(box)
+        return "continue" if box.clickedButton() == continue_button else None
+
     def _select_edited_video(self, project: Project) -> None:
         file_name, _selected_filter = QFileDialog.getOpenFileName(
             self,
@@ -2367,7 +3080,12 @@ class MainWindow(QMainWindow):
         )
         if not file_name:
             return
-        self._assign_edited_video(project, Path(file_name))
+        video_path = Path(file_name)
+        action = self._confirm_edited_video_assignment(project, video_path)
+        if action in {"continue", "replace"}:
+            self._assign_edited_video(project, video_path)
+        elif action == "export":
+            self._add_export_only(project, video_path)
 
     def _assign_edited_video(self, project: Project, video_path: Path) -> None:
         self._run_background(
@@ -2382,9 +3100,8 @@ class MainWindow(QMainWindow):
         if project is None:
             return
         self._after_project_changed(project)
-        if project.status not in {"Need Upload", "Done"}:
-            answer = QMessageBox.question(
-                self,
+        if project.status not in {"Need Upload", "Done", PUBLISHED_STATUS}:
+            answer = self._focused_question(
                 "Update Status",
                 "Edited video is set. Move this project to Need Upload?",
             )
@@ -2634,13 +3351,16 @@ class MainWindow(QMainWindow):
         )
         if not accepted or not name.strip():
             return
-        try:
-            self.project_service.rename_asset(asset_id, name)
-        except Exception as error:
-            QMessageBox.critical(self, "Could Not Rename Asset", str(error))
+        success, _renamed = self._run_asset_file_operation(
+            "Could Not Rename Asset",
+            [asset_id],
+            lambda: self.project_service.rename_asset(asset_id, name),
+        )
+        if not success:
             return
         self._show_file_warnings()
         self.refresh_assets()
+        self._restore_asset_selection([asset_id])
         self.refresh_projects()
         self.refresh_activity()
 
@@ -2670,15 +3390,109 @@ class MainWindow(QMainWindow):
     def _move_assets_to_folder(self, asset_ids: list[int], destination: Path) -> None:
         if not asset_ids:
             return
-        try:
-            self.project_service.move_assets(asset_ids, destination)
-        except Exception as error:
-            QMessageBox.critical(self, "Could Not Move Assets", str(error))
+        success, _moved = self._run_asset_file_operation(
+            "Could Not Move Assets",
+            asset_ids,
+            lambda: self.project_service.move_assets(asset_ids, destination),
+        )
+        if not success:
             return
         self._show_file_warnings()
         self.refresh_assets()
+        self._restore_asset_selection(asset_ids)
         self.refresh_projects()
         self.refresh_activity()
+
+    def _show_asset_tree_context_menu(self, position) -> None:
+        item = self.assets_tree.itemAt(position)
+        if item is None:
+            return
+        if item not in self.assets_tree.selectedItems():
+            self.assets_tree.clearSelection()
+            self.assets_tree.setCurrentItem(item)
+            item.setSelected(True)
+        asset = self._asset_from_tree_item(item)
+        if asset is None:
+            return
+
+        selected_ids = self.assets_tree.selected_asset_ids()
+        make_favorite = any(asset_id not in self._asset_favorite_ids for asset_id in selected_ids)
+        favorite_text = "Add to Favorites" if make_favorite else "Remove from Favorites"
+
+        menu = QMenu(self)
+        preview_action = menu.addAction(self._asset_action_icon("Preview"), "Preview")
+        favorite_action = menu.addAction(self._asset_action_icon(favorite_text, favorite=not make_favorite), favorite_text)
+        rename_action = menu.addAction(self._asset_action_icon("Rename"), "Rename")
+        rename_action.setEnabled(len(selected_ids) == 1)
+        move_action = menu.addAction(self._asset_action_icon("Move"), "Move")
+        tags_action = menu.addAction(self._asset_action_icon("Edit Tags"), "Edit Tags")
+        tags_action.setEnabled(len(selected_ids) == 1)
+        open_action = menu.addAction(self._asset_action_icon("Open in Explorer"), "Open in Explorer")
+        menu.addSeparator()
+        delete_action = menu.addAction(self._asset_action_icon("Delete"), "Delete")
+
+        selected = menu.exec(self.assets_tree.mapToGlobal(position))
+        if selected == preview_action:
+            self._preview_selected_assets()
+        elif selected == favorite_action:
+            self._toggle_selected_asset_favorite()
+        elif selected == rename_action:
+            self._rename_selected_asset()
+        elif selected == move_action:
+            self._move_selected_assets()
+        elif selected == tags_action:
+            self._edit_selected_asset_tags()
+        elif selected == open_action:
+            self._open_selected_asset_location()
+        elif selected == delete_action:
+            self._delete_selected_assets()
+
+    def _preview_selected_assets(self) -> None:
+        if self.assets_preview_panel.isHidden():
+            self._toggle_assets_preview_panel()
+        self._update_asset_preview_from_selection(autoplay=True)
+
+    def _toggle_selected_asset_favorite(self) -> None:
+        asset_ids = self.assets_tree.selected_asset_ids()
+        if not asset_ids:
+            return
+        favorite_ids = self.project_service.favorite_asset_ids()
+        make_favorite = any(asset_id not in favorite_ids for asset_id in asset_ids)
+        for asset_id in asset_ids:
+            self.project_service.set_asset_favorite(asset_id, make_favorite)
+        self.refresh_assets()
+
+    def _import_dropped_asset_paths(self, paths: list[Path], destination: Path) -> None:
+        existing_paths = [path for path in paths if path.exists()]
+        if not existing_paths:
+            self._show_toast("No importable files found", message_type="warning")
+            return
+        folders = [path for path in existing_paths if path.is_dir()]
+        files = [path for path in existing_paths if path.is_file()]
+        if folders:
+            answer = QMessageBox.question(
+                self,
+                "Import Asset Folder",
+                (
+                    f"Move {len(folders)} folder(s) into the EditFlow Asset Library?\n\n"
+                    "Folder structure will be preserved. Files are not flattened."
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            if files:
+                self.project_service.import_asset_files(files, destination)
+            for folder in folders:
+                self.project_service.import_asset_folder(folder, destination)
+        except Exception as error:
+            QMessageBox.critical(self, "Could Not Import Assets", str(error))
+            return
+        self.refresh_assets()
+        self.refresh_activity()
+        self._show_toast(f"Imported {len(files) + len(folders)} asset(s)", message_type="success")
 
     def _delete_selected_assets(self) -> None:
         asset_ids = self.assets_tree.selected_asset_ids()
@@ -2704,10 +3518,12 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            self.project_service.delete_assets(asset_ids)
-        except Exception as error:
-            QMessageBox.critical(self, "Could Not Delete Assets", str(error))
+        success, _deleted = self._run_asset_file_operation(
+            "Could Not Delete Assets",
+            asset_ids,
+            lambda: self.project_service.delete_assets(asset_ids),
+        )
+        if not success:
             return
         self._show_file_warnings()
         self.refresh_assets()
@@ -2774,7 +3590,7 @@ class MainWindow(QMainWindow):
         try:
             updated = self.project_service.link_assets(project, new_assets)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Assets", str(error))
+            self._focused_critical("Could Not Link Assets", str(error))
             return
         self._show_file_warnings()
         self._after_project_changed(updated, refresh_assets=True)
@@ -2805,7 +3621,7 @@ class MainWindow(QMainWindow):
             asset = self.project_service.create_asset(**dialog.values())
             updated = self.project_service.link_asset(project, asset)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Asset", str(error))
+            self._focused_critical("Could Not Link Asset", str(error))
             return
 
         self._after_project_changed(updated, refresh_assets=True)
@@ -2816,7 +3632,7 @@ class MainWindow(QMainWindow):
         try:
             updated = self.project_service.link_asset(project, asset)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Asset", str(error))
+            self._focused_critical("Could Not Link Asset", str(error))
             return
         self._show_file_warnings()
         self._after_project_changed(updated, refresh_assets=True)
@@ -2839,7 +3655,7 @@ class MainWindow(QMainWindow):
         try:
             updated = self.project_service.link_asset(project, asset)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Asset", str(error))
+            self._focused_critical("Could Not Link Asset", str(error))
             return
         self._show_file_warnings()
         self._after_project_changed(updated, refresh_assets=True)
@@ -2857,10 +3673,22 @@ class MainWindow(QMainWindow):
         try:
             updated = self.project_service.link_assets(project, assets)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Assets", str(error))
+            self._focused_critical("Could Not Link Assets", str(error))
             return
         self._show_file_warnings()
         self._after_project_changed(updated, refresh_assets=True)
+
+    def _handle_edited_video_dropped(self, project: Project, path: Path) -> None:
+        if project.id is not None:
+            project = self.project_service.get_project(project.id) or project
+        if not path.exists() or not path.is_file() or not is_mp4_file(path):
+            self._play_sound("warning")
+            self._focused_warning(
+                "Invalid Edited Video",
+                "Drop a valid MP4 video file onto the edited-video slot.",
+            )
+            return
+        self._handle_dropped_mp4(project, path, edited_slot=True)
 
     def _handle_card_files_dropped(self, project: Project, paths: list[Path]) -> None:
         asset_paths: list[Path] = []
@@ -2874,34 +3702,37 @@ class MainWindow(QMainWindow):
         if asset_paths:
             self._link_asset_paths(project, asset_paths)
 
-    def _handle_dropped_mp4(self, project: Project, path: Path) -> None:
-        box = QMessageBox(self)
-        box.setWindowTitle("MP4 Dropped")
-        if project.has_edited_video:
-            box.setText(f"{project.name} already has an edited video.")
-            box.setInformativeText(f"What should EditFlow do with {path.name}?")
-            replace_button = box.addButton("Replace Current", QMessageBox.ButtonRole.AcceptRole)
-            export_button = box.addButton("Add as Another Export", QMessageBox.ButtonRole.ActionRole)
-            box.addButton(QMessageBox.StandardButton.Cancel)
-            box.exec()
-
-            clicked = box.clickedButton()
-            if clicked == replace_button:
+    def _handle_dropped_mp4(
+        self,
+        project: Project,
+        path: Path,
+        *,
+        edited_slot: bool = False,
+    ) -> None:
+        if project.has_edited_video or edited_slot:
+            action = self._confirm_edited_video_assignment(project, path)
+            if action in {"continue", "replace"}:
                 self._assign_edited_video(project, path)
-            elif clicked == export_button:
+            elif action == "export":
                 self._add_export_only(project, path)
             return
-        else:
-            box.setText(f"Set {path.name} as the edited video?")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("MP4 Dropped")
+        box.setText(f"Set {path.name} as the edited video?")
         box.setInformativeText("The raw video will not be replaced.")
         edited_button = box.addButton("Set Edited Video", QMessageBox.ButtonRole.AcceptRole)
         asset_button = box.addButton("Link as Asset", QMessageBox.ButtonRole.ActionRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
+        self._exec_focused_message_box(box)
 
         clicked = box.clickedButton()
         if clicked == edited_button:
-            self._assign_edited_video(project, path)
+            action = self._confirm_edited_video_assignment(project, path)
+            if action in {"continue", "replace"}:
+                self._assign_edited_video(project, path)
+            elif action == "export":
+                self._add_export_only(project, path)
         elif clicked == asset_button:
             self._link_asset_path(project, path, confirm=False)
 
@@ -2916,9 +3747,8 @@ class MainWindow(QMainWindow):
     def _export_file_added(self, project: Project) -> None:
         updated = self.project_service.get_project(project.id or 0) or project
         self._after_project_changed(updated)
-        if updated.status not in {"Need Upload", "Done"}:
-            answer = QMessageBox.question(
-                self,
+        if updated.status not in {"Need Upload", "Done", PUBLISHED_STATUS}:
+            answer = self._focused_question(
                 "Update Status",
                 "Export added. Move this project to Need Upload?",
             )
@@ -2963,14 +3793,13 @@ class MainWindow(QMainWindow):
             ]
             updated = self.project_service.link_assets(project, assets)
         except Exception as error:
-            QMessageBox.critical(self, "Could Not Link Assets", str(error))
+            self._focused_critical("Could Not Link Assets", str(error))
             return
         self._show_file_warnings()
         self._after_project_changed(updated, refresh_assets=True)
 
     def _confirm_asset_link(self, project: Project, asset_name: str) -> bool:
-        answer = QMessageBox.question(
-            self,
+        answer = self._focused_question(
             "Link Asset",
             f"Link {asset_name} to {project.name}?",
         )
@@ -2984,8 +3813,7 @@ class MainWindow(QMainWindow):
         sample = "\n".join(path.name for path in paths[:5])
         if len(paths) > 5:
             sample = f"{sample}\n...and {len(paths) - 5} more"
-        answer = QMessageBox.question(
-            self,
+        answer = self._focused_question(
             "Add and Link Assets",
             "Add these files/folders to the managed Asset Library and link them to this project?\n"
             "Files are copied into the library; folders are moved into the library.\n\n"
@@ -2998,8 +3826,7 @@ class MainWindow(QMainWindow):
         project: Project,
         paths: list[Path],
     ) -> bool:
-        answer = QMessageBox.question(
-            self,
+        answer = self._focused_question(
             "Link Assets",
             f"Link {len(paths)} asset(s) to {project.name}?",
         )
@@ -3013,8 +3840,7 @@ class MainWindow(QMainWindow):
         sample = "\n".join(asset.name for asset in assets[:6])
         if len(assets) > 6:
             sample = f"{sample}\n...and {len(assets) - 6} more"
-        answer = QMessageBox.question(
-            self,
+        answer = self._focused_question(
             "Link Assets",
             f"Link {len(assets)} asset(s) to {project.name}?\n\n{sample}",
         )
@@ -3024,7 +3850,7 @@ class MainWindow(QMainWindow):
         warnings = self.project_service.consume_file_warnings()
         if warnings:
             self._play_sound("warning")
-            QMessageBox.warning(self, "File Link Warning", "\n\n".join(warnings))
+            self._focused_warning("File Link Warning", "\n\n".join(warnings))
 
     def _scan_project_folder(self, project: Project | None = None) -> None:
         self._schedule_detection_scan()
@@ -3149,7 +3975,7 @@ class MainWindow(QMainWindow):
 
     def _create_project_from_detected_raw(self, raw_path: Path) -> None:
         dialog = self._raw_video_dialog(raw_path)
-        if dialog.exec() != dialog.DialogCode.Accepted:
+        if self._exec_focused_dialog(dialog) != dialog.DialogCode.Accepted:
             return
         values = dialog.values()
         self.project_service.mark_detection_status(raw_path, "accepted")
@@ -3181,8 +4007,7 @@ class MainWindow(QMainWindow):
         self._after_project_changed(updated)
         self.refresh_activity()
         self._dismiss_detection()
-        answer = QMessageBox.question(
-            self,
+        answer = self._focused_question(
             "Update Status",
             "Change this project status to Need Upload?",
         )
@@ -3279,6 +4104,9 @@ class MainWindow(QMainWindow):
             return
         self._after_project_changed(updated)
         self.refresh_activity()
+
+    def _open_assets_library_root(self) -> None:
+        self._open_path(self.project_service.asset_library_root())
 
     def _open_selected_asset_location(self) -> None:
         asset_id = self.assets_tree.current_asset_id()
@@ -3499,17 +4327,19 @@ class MainWindow(QMainWindow):
                     item.setIcon(0, icon)
                 iterator += 1
 
-        for index in range(self.recent_assets_list.count()):
-            item = self.recent_assets_list.item(index)
-            path = Path(item.toolTip())
-            if item.toolTip() and normalize_file_path(path) == normalized_path:
-                item.setIcon(icon)
+        if hasattr(self, "recent_assets_list"):
+            for index in range(self.recent_assets_list.count()):
+                item = self.recent_assets_list.item(index)
+                path = Path(item.toolTip())
+                if item.toolTip() and normalize_file_path(path) == normalized_path:
+                    item.setIcon(icon)
 
-        for index in range(self.most_used_assets_list.count()):
-            item = self.most_used_assets_list.item(index)
-            path = Path(item.toolTip())
-            if item.toolTip() and normalize_file_path(path) == normalized_path:
-                item.setIcon(icon)
+        if hasattr(self, "most_used_assets_list"):
+            for index in range(self.most_used_assets_list.count()):
+                item = self.most_used_assets_list.item(index)
+                path = Path(item.toolTip())
+                if item.toolTip() and normalize_file_path(path) == normalized_path:
+                    item.setIcon(icon)
 
     def _run_background(
         self,
@@ -3570,8 +4400,47 @@ class MainWindow(QMainWindow):
             return
         self.loading_panel.setVisible(False)
 
-    def _show_toast(self, message: str, duration_ms: int = 2600) -> None:
+    def _hide_toast(self) -> None:
+        if not hasattr(self, "toast_label"):
+            return
+        self.toast_label.setVisible(False)
+        if hasattr(self, "content_widget") and self.toast_label.parentWidget() != self.content_widget:
+            self.toast_label.setParent(self.content_widget)
+            self.toast_label.setVisible(False)
+
+    def _toast_message_type(self, message: str, message_type: str | None = None) -> str:
+        allowed_types = {"success", "error", "warning", "info"}
+        if message_type in allowed_types:
+            return message_type
+
+        text = message.strip()
+        lowered = text.lower()
+        if text.startswith("\u2713"):
+            return "success"
+        if any(marker in lowered for marker in ("blocked", "could not", "failed", "error", "invalid")):
+            return "error"
+        if any(marker in lowered for marker in ("warning", "missing", "not found")):
+            return "warning"
+        return "info"
+
+    def _apply_toast_style(self, message_type: str) -> None:
+        self.toast_label.setProperty("message_type", message_type)
+        self.toast_label.style().unpolish(self.toast_label)
+        self.toast_label.style().polish(self.toast_label)
+
+    def _show_toast(
+        self,
+        message: str,
+        duration_ms: int = 2600,
+        *,
+        message_type: str | None = None,
+    ) -> None:
+        toast_type = self._toast_message_type(message, message_type)
+        self.toast_hide_timer.stop()
+        if self.toast_label.parentWidget() != self.content_widget:
+            self.toast_label.setParent(self.content_widget)
         self.toast_label.setText(message)
+        self._apply_toast_style(toast_type)
         self.toast_label.setVisible(True)
         self._position_toast()
         self.toast_label.raise_()
@@ -3580,43 +4449,47 @@ class MainWindow(QMainWindow):
 
 STYLESHEET = """
 QMainWindow, QWidget {
-    background: #0c1118;
-    color: #eef3ff;
+    background: #07111F;
+    color: #FFFFFF;
     font-family: Segoe UI, Arial, sans-serif;
     font-size: 13px;
 }
 QFrame#Sidebar {
-    background: #111824;
-    border-right: 1px solid #2d3a4f;
+    background: #101E32;
+    border-right: 1px solid #223653;
 }
 QFrame#DetailsPanel {
-    background: #111824;
-    border-left: 1px solid #3a4a63;
+    background: #101E32;
+    border-left: 1px solid #223653;
 }
 QFrame#DetailsGutter {
-    background: #0c1118;
+    background: #07111F;
     border: none;
 }
 QFrame#DetailsRail {
-    background: #172334;
-    border-left: 1px solid #34445e;
-    border-right: 1px solid #0b1017;
+    background: #0B1728;
+    border-left: 1px solid #223653;
+    border-right: 1px solid #07111F;
 }
 QFrame#LoadingOverlay {
     background: rgba(7, 11, 18, 95);
     border: none;
 }
+QFrame#ModalFocusOverlay {
+    background: rgba(0, 0, 0, 145);
+    border: none;
+}
 QFrame#LoadingCard {
-    background: #111824;
-    border: 1px solid #3a4a63;
+    background: #101E32;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QLabel#LoadingIcon {
-    color: #8fb0ff;
+    color: #25D7F2;
     font-size: 14px;
 }
 QLabel#LoadingLabel {
-    color: #dce6f6;
+    color: #FFFFFF;
     font-weight: 700;
 }
 QWidget#EarningsAnimationStage {
@@ -3632,76 +4505,135 @@ QLabel#EarningsAnimationLabel {
     padding: 0;
 }
 QProgressBar#LoadingProgress {
-    background: #0b1017;
-    border: 1px solid #2d3a4f;
+    background: #07111F;
+    border: 1px solid #223653;
     border-radius: 3px;
 }
 QProgressBar#LoadingProgress::chunk {
-    background: #5f7dff;
+    background: #168BFF;
     border-radius: 3px;
 }
 QLabel#ToastLabel {
-    background: #10251b;
-    border: 1px solid #2a7a56;
+    background: #0D2438;
+    border: 1px solid #168BFF;
     border-radius: 8px;
-    color: #b8ffd4;
+    color: #CFFAFE;
     font-weight: 800;
     padding: 9px 12px;
 }
+QLabel#ToastLabel[message_type="success"] {
+    background: #10251b;
+    border: 1px solid #2a7a56;
+    color: #b8ffd4;
+}
+QLabel#ToastLabel[message_type="error"] {
+    background: #2B1117;
+    border: 1px solid #E34B5B;
+    color: #FFD2D8;
+}
+QLabel#ToastLabel[message_type="warning"] {
+    background: #2A210D;
+    border: 1px solid #D99A23;
+    color: #FFE3A3;
+}
+QLabel#ToastLabel[message_type="info"] {
+    background: #0D2438;
+    border: 1px solid #168BFF;
+    color: #CFFAFE;
+}
 QFrame#AssetPreviewPanel {
-    background: #111824;
-    border: 1px solid #303d52;
+    background: #101E32;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QLabel#AssetPreviewMedia {
-    background: #0b1017;
-    border: 1px solid #26344a;
+    background: #07111F;
+    border: 1px solid #223653;
     border-radius: 8px;
-    color: #9fb0c7;
+    color: #8EA4C2;
     font-size: 18px;
     font-weight: 700;
     padding: 10px;
 }
 QVideoWidget#AssetVideoPreview {
-    background: #0b1017;
-    border: 1px solid #26344a;
+    background: #07111F;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QFrame#AssetMediaControls {
     background: transparent;
     border: 0;
 }
+QFrame#AssetVolumePopup {
+    background: #101E32;
+    border: 1px solid #168BFF;
+    border-radius: 8px;
+}
+QDialog#AssetQuickPreviewDialog {
+    background: #07111F;
+}
+QStackedWidget#QuickPreviewStack, QWidget#QuickPreviewCanvas, QVideoWidget#QuickPreviewVideo, QLabel#QuickPreviewMessage {
+    background: #07111F;
+    border: 1px solid #223653;
+    border-radius: 8px;
+    color: #8EA4C2;
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#QuickPreviewTitle {
+    color: #FFFFFF;
+    font-size: 15px;
+    font-weight: 800;
+}
+QFrame#QuickPreviewControls {
+    background: transparent;
+    border: 0;
+}
+QPushButton#AssetVolumeButton {
+    background: #0B1728;
+    border: 1px solid #223653;
+    border-radius: 6px;
+    padding: 0;
+}
+QPushButton#AssetVolumeButton:hover {
+    background: #12345A;
+    border-color: #168BFF;
+}
+QPushButton#AssetVolumeMuteButton {
+    padding: 3px 5px;
+    font-size: 11px;
+}
 QSplitter::handle {
-    background: #172334;
+    background: #0B1728;
 }
 QSplitter::handle:hover {
-    background: #2b3f5d;
+    background: #12345A;
 }
 QLabel#AssetBadge {
-    background: #172334;
-    border: 1px solid #34445e;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 8px;
-    color: #dce6f6;
+    color: #FFFFFF;
     font-size: 11px;
     font-weight: 700;
     padding: 3px 7px;
 }
 QPushButton#PickerFilterButton {
-    background: #151d2a;
-    border: 1px solid #34445e;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 8px;
-    color: #b9c7dc;
+    color: #8EA4C2;
     padding: 5px 9px;
 }
 QPushButton#PickerFilterButton:checked {
-    background: #24344b;
-    border-color: #5f7dff;
+    background: #12345A;
+    border-color: #168BFF;
     color: #ffffff;
     font-weight: 800;
 }
 QLabel#LogoBadge {
-    background: #4567ff;
-    border: 1px solid #6d84ff;
+    background: #168BFF;
+    border: 1px solid #25D7F2;
     border-radius: 8px;
     color: #ffffff;
     font-weight: 700;
@@ -3727,14 +4659,14 @@ QLabel#PageTitle {
 QPushButton#PageTitleButton {
     background: transparent;
     border: none;
-    color: #eef4ff;
+    color: #FFFFFF;
     font-size: 24px;
     font-weight: 700;
     padding: 0;
     text-align: left;
 }
 QPushButton#PageTitleButton:hover {
-    color: #8fb0ff;
+    color: #25D7F2;
 }
 QLabel#SectionTitle {
     font-size: 16px;
@@ -3758,18 +4690,51 @@ QLabel#CardTitle {
     font-weight: 700;
 }
 QLabel#MutedLabel, QLabel#PathLabel {
-    color: #aab6c9;
+    color: #8EA4C2;
 }
 QLabel#PathLabel {
     font-size: 12px;
 }
+QWidget#AssetBreadcrumbBar {
+    background: transparent;
+}
+QPushButton#BreadcrumbBackButton, QPushButton#BreadcrumbButton {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: #8EA4C2;
+    font-weight: 700;
+    padding: 4px 7px;
+}
+QPushButton#BreadcrumbBackButton:hover, QPushButton#BreadcrumbButton:hover {
+    background: #10233D;
+    border-color: #168BFF;
+    color: #25D7F2;
+}
+QPushButton#BreadcrumbBackButton:disabled {
+    color: #3A506C;
+    border-color: transparent;
+    background: transparent;
+}
+QPushButton#BreadcrumbButton[current="true"] {
+    background: #12345A;
+    border-color: #168BFF;
+    color: #FFFFFF;
+    font-weight: 900;
+}
+QLabel#BreadcrumbSeparator {
+    background: transparent;
+    color: #2E4B70;
+    font-weight: 800;
+    padding: 0 2px;
+}
 QLabel#AssetCountLink {
-    color: #c7d4e8;
+    color: #DCE8F8;
     font-size: 12px;
     padding: 2px 0;
 }
 QLabel#AssetCountLink:hover {
-    color: #8fb0ff;
+    color: #25D7F2;
 }
 QLabel#EarningsBadge {
     background: transparent;
@@ -3785,51 +4750,61 @@ QLabel#EarningsBadge[earned="true"] {
     color: #35d07f;
 }
 QPushButton#CardIconButton {
-    background: #1b2637;
-    border: 1px solid #34445e;
+    background: #101E32;
+    border: 1px solid #223653;
     border-radius: 6px;
-    color: #d8e1f0;
+    color: #DCE8F8;
     font-size: 12px;
     padding: 0;
 }
 QPushButton#CardIconButton:hover {
-    background: #24344b;
-    border-color: #5f7dff;
+    background: #12345A;
+    border-color: #168BFF;
 }
 QLabel#Thumbnail, QLabel#LargeThumbnail {
-    background: #0b1017;
-    border: 1px solid #26344a;
+    background: #07111F;
+    border: 1px solid #223653;
     border-radius: 6px;
-    color: #72819a;
+    color: #6F86A6;
 }
 QPushButton#AddEditedVideoButton {
-    background: #101827;
-    border: 1px dashed #3b4d69;
+    background: #0B1728;
+    border: 1px dashed #223653;
     border-radius: 6px;
-    color: #b9c7dc;
+    color: #8EA4C2;
     font-size: 8px;
     font-weight: 700;
     padding: 0;
     text-align: center;
 }
 QPushButton#AddEditedVideoButton:hover {
-    background: #172238;
-    border-color: #5f7dff;
-    color: #eef4ff;
+    background: #10233D;
+    border-color: #168BFF;
+    color: #FFFFFF;
+}
+QPushButton#AddEditedVideoButton[drop_active="true"] {
+    background: #12345A;
+    border: 1px solid #25D7F2;
+    color: #FFFFFF;
+}
+QLabel#Thumbnail[drop_active="true"] {
+    background: #10233D;
+    border: 2px solid #25D7F2;
+    color: #FFFFFF;
 }
 QLabel#StatusPill, QLabel#NeutralPill, QLabel#GoodPill {
-    background: #243044;
-    border: 1px solid #34445e;
+    background: #13243A;
+    border: 1px solid #223653;
     border-radius: 8px;
     padding: 3px 8px;
-    color: #d8e1f0;
+    color: #DCE8F8;
 }
 QLabel#VideoTypePill {
-    background: #243044;
-    border: 1px solid #34445e;
+    background: #13243A;
+    border: 1px solid #223653;
     border-radius: 8px;
     padding: 3px 6px;
-    color: #d8e1f0;
+    color: #DCE8F8;
     font-size: 11px;
 }
 QLabel#VideoTypePill[compact="true"] {
@@ -3856,24 +4831,24 @@ QLabel#ColumnTitle {
     font-weight: 700;
 }
 QLabel#ColumnCount {
-    background: #273348;
+    background: #13243A;
     border-radius: 8px;
     padding: 3px 8px;
-    color: #cbd7ea;
+    color: #DCE8F8;
 }
 QFrame#KanbanColumn {
-    background: #151d2a;
-    border: 1px solid #303d52;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QFrame#ProjectCard {
-    background: #111824;
-    border: 1px solid #30405a;
+    background: #101E32;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QFrame#ProjectCard[readiness="blocked"] {
-    border: 1px solid #3a465a;
-    background: #111824;
+    border: 1px solid #223653;
+    background: #101E32;
 }
 QFrame#ProjectCard[readiness="ready"] {
     border: 2px solid #35d07f;
@@ -3883,33 +4858,9 @@ QFrame#ProjectCard[readiness="revision"] {
     border: 2px solid #c48924;
     background: #21190d;
 }
-QFrame#ProjectCard[selected="true"] {
-    border: 2px solid #5577ff;
-    background: #172238;
-}
-QFrame#ProjectCard[selected="true"][readiness="blocked"] {
-    border: 2px solid #5577ff;
-    background: #172238;
-}
-QFrame#ProjectCard[selected="true"][readiness="ready"] {
-    border: 2px solid #35d07f;
-    background: #142a23;
-}
-QFrame#ProjectCard[selected="true"][readiness="revision"] {
-    border: 2px solid #d19a33;
-    background: #2a200f;
-}
-QFrame#ProjectCard[flow="true"] {
-    border: 2px solid #7dd3fc;
-    background: #162537;
-}
-QFrame#ProjectCard[flow="true"][selected="true"] {
-    border: 2px solid #fbbf24;
-    background: #1d2d43;
-}
 QFrame#ProjectCard[hovered="true"] {
-    background: #172233;
-    border-color: #465b78;
+    background: #13243A;
+    border-color: #2A4A70;
 }
 QFrame#ProjectCard[hovered="true"][readiness="ready"] {
     background: #142b23;
@@ -3919,32 +4870,12 @@ QFrame#ProjectCard[hovered="true"][readiness="revision"] {
     background: #2a210f;
     border-color: #d69a2b;
 }
-QFrame#ProjectCard[hovered="true"][selected="true"] {
-    background: #1b2a45;
-    border-color: #6d89ff;
-}
-QFrame#ProjectCard[hovered="true"][selected="true"][readiness="ready"] {
-    background: #173229;
-    border-color: #61e89b;
-}
-QFrame#ProjectCard[hovered="true"][selected="true"][readiness="revision"] {
-    background: #302611;
-    border-color: #e3aa3a;
-}
-QFrame#ProjectCard[hovered="true"][flow="true"] {
-    background: #1a2d43;
-    border-color: #9be2ff;
-}
-QFrame#ProjectCard[hovered="true"][flow="true"][selected="true"] {
-    background: #223753;
-    border-color: #ffd166;
-}
 QFrame#ProjectCard[dragging="true"] {
-    background: #242833;
-    border: 2px dashed #6f7786;
+    background: #172236;
+    border: 2px dashed #8EA4C2;
 }
 QFrame#DropIndicator {
-    background: #7aa2ff;
+    background: #25D7F2;
     border-radius: 1px;
     min-height: 3px;
     max-height: 3px;
@@ -3955,91 +4886,110 @@ QFrame#RevisionNoteRow {
     border-radius: 8px;
 }
 QFrame#RevisionNoteRow[completed="true"] {
-    background: #141b26;
-    border: 1px solid #2d3a4f;
-    color: #7f8ca3;
+    background: #0B1728;
+    border: 1px solid #223653;
+    color: #8EA4C2;
 }
 QFrame#RevisionNoteRow[completed="true"] QLabel {
-    color: #7f8ca3;
+    color: #8EA4C2;
 }
 QFrame#RevisionNoteRow QCheckBox {
     spacing: 6px;
 }
 QFrame#MetricCard {
-    background: #151d2a;
-    border: 1px solid #303d52;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 8px;
 }
 QGroupBox {
-    border: 1px solid #344158;
+    border: 1px solid #223653;
     border-radius: 8px;
     margin-top: 10px;
     padding: 12px 8px 8px 8px;
-    color: #dce6f6;
+    color: #FFFFFF;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
     left: 10px;
     padding: 0 4px;
-    color: #9fb0c7;
+    color: #8EA4C2;
 }
 QLineEdit, QTextEdit, QComboBox, QListWidget, QTableWidget, QTreeWidget {
-    background: #151d2a;
-    border: 1px solid #2a3850;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 6px;
     padding: 8px;
-    selection-background-color: #4968ff;
+    selection-background-color: #168BFF;
 }
 QHeaderView::section {
-    background: #1a2332;
-    color: #dce6f6;
+    background: #0B1728;
+    color: #FFFFFF;
     border: 0;
-    border-right: 1px solid #2a3850;
+    border-right: 1px solid #223653;
     padding: 8px;
 }
 QToolTip {
-    background: #172238;
-    border: 1px solid #4a5b74;
+    background: #10233D;
+    border: 1px solid #223653;
     border-radius: 6px;
-    color: #edf3ff;
+    color: #FFFFFF;
     padding: 8px;
 }
 QPushButton {
-    background: #1d2838;
-    border: 1px solid #33435d;
+    background: #101E32;
+    border: 1px solid #223653;
     border-radius: 7px;
     padding: 6px 9px;
-    color: #edf3ff;
+    color: #FFFFFF;
     font-size: 12px;
 }
 QPushButton:hover {
-    background: #26344a;
+    background: #223653;
 }
 QPushButton#PrimaryButton {
-    background: #4567ff;
-    border: 1px solid #6680ff;
-    font-weight: 700;
+    background: #168BFF;
+    border: 1px solid #25D7F2;
+    color: #FFFFFF;
+    font-weight: 800;
+}
+QPushButton#PrimaryButton:hover {
+    background: #25D7F2;
+    border-color: #66EAFF;
+    color: #07111F;
+}
+QFrame#Sidebar QPushButton#PrimaryButton,
+QPushButton#SubtleButton {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #25D7F2, stop:1 #168BFF);
+    border: 1px solid #25D7F2;
+    color: #FFFFFF;
+    font-weight: 900;
+}
+QFrame#Sidebar QPushButton#PrimaryButton:hover,
+QPushButton#SubtleButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #66EAFF, stop:1 #2B9BFF);
+    border-color: #66EAFF;
+    color: #07111F;
 }
 QPushButton#PublishButton {
-    background: #233142;
-    border: 1px solid #4a5b74;
-    color: #dce6f6;
+    background: #101E32;
+    border: 1px solid #223653;
+    color: #FFFFFF;
     font-weight: 700;
 }
 QPushButton#PublishButton:hover {
-    background: #2d3d52;
+    background: #13243A;
 }
 QPushButton#PriorityButton {
-    background: #192232;
-    border: 1px solid #3a4a63;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 11px;
-    color: #8f9bb0;
+    color: #8EA4C2;
     font-size: 12px;
     font-weight: 700;
     padding: 0;
 }
 QPushButton#PriorityButton:hover {
-    background: #253249;
+    background: #13243A;
     color: #f2c94c;
 }
 QPushButton#PriorityButton[priority="true"] {
@@ -4048,10 +4998,10 @@ QPushButton#PriorityButton[priority="true"] {
     color: #ffd166;
 }
 QLabel#NoteIndicator {
-    background: #192232;
-    border: 1px solid #3a4a63;
+    background: #0B1728;
+    border: 1px solid #223653;
     border-radius: 11px;
-    color: #7f8ca3;
+    color: #8EA4C2;
     font-size: 12px;
 }
 QLabel#NoteIndicator[has_notes="true"] {
@@ -4068,7 +5018,7 @@ QPushButton#PanelCollapseButton {
     background: transparent;
     border: none;
     border-radius: 8px;
-    color: #dce6f6;
+    color: #FFFFFF;
     font-size: 16px;
     font-weight: 800;
     padding: 0;
@@ -4076,12 +5026,16 @@ QPushButton#PanelCollapseButton {
     max-width: 22px;
 }
 QPushButton#PanelCollapseButton:hover {
-    background: #24344b;
+    background: #12345A;
     color: #ffffff;
 }
 QPushButton#SubtleButton, QPushButton#NavButton {
     text-align: left;
     padding: 6px 8px;
+}
+QPushButton#NavButton:hover {
+    background: #10233D;
+    border-color: #168BFF;
 }
 QFrame#Sidebar QPushButton#NavButton,
 QFrame#Sidebar QPushButton#PrimaryButton {
@@ -4092,12 +5046,12 @@ QFrame#Sidebar QPushButton#PrimaryButton {
 }
 QFrame#Sidebar QLabel#SidebarButtonIcon {
     background: transparent;
-    color: #dce6f6;
+    color: #DCE8F8;
     font-size: 17px;
 }
 QFrame#Sidebar QLabel#SidebarButtonLabel {
     background: transparent;
-    color: #dce6f6;
+    color: #DCE8F8;
     font-size: 13px;
     font-weight: 650;
     padding-left: 8px;
@@ -4112,16 +5066,16 @@ QFrame#Sidebar QPushButton#PrimaryButton[collapsed="true"] {
     background: transparent;
     border: none;
     border-radius: 10px;
-    color: #dce6f6;
+    color: #FFFFFF;
     font-size: 17px;
     padding: 0;
     text-align: center;
 }
 QFrame#Sidebar QPushButton#NavButton[collapsed="true"]:hover,
 QFrame#Sidebar QPushButton#PrimaryButton[collapsed="true"]:hover {
-    background: #172334;
+    background: #10233D;
     border: none;
-    color: #ffffff;
+    color: #25D7F2;
 }
 QFrame#Sidebar QPushButton#PrimaryButton[collapsed="true"] {
     font-weight: 800;
@@ -4130,7 +5084,7 @@ QScrollArea {
     background: transparent;
 }
 QScrollArea#KanbanCardsScroll {
-    border-top: 1px solid #243044;
+    border-top: 1px solid #13243A;
 }
 QWidget#KanbanCardsViewport {
     background: transparent;
@@ -4141,12 +5095,12 @@ QScrollBar:vertical {
     margin: 0;
 }
 QScrollBar::handle:vertical {
-    background: #46566f;
+    background: #2E4B70;
     border-radius: 3px;
     min-height: 28px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #6a7da0;
+    background: #168BFF;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
@@ -4162,12 +5116,12 @@ QScrollBar:horizontal {
     margin: 0;
 }
 QScrollBar::handle:horizontal {
-    background: #46566f;
+    background: #2E4B70;
     border-radius: 3px;
     min-width: 28px;
 }
 QScrollBar::handle:horizontal:hover {
-    background: #6a7da0;
+    background: #168BFF;
 }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;

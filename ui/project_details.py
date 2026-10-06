@@ -70,7 +70,7 @@ class ProjectDetails(QFrame):
 
         self.collapse_button = QPushButton("≪")
         self.collapse_button.setObjectName("PanelCollapseButton")
-        self.collapse_button.setFixedSize(22, 42)
+        self.collapse_button.setFixedSize(20, 36)
         self.collapse_button.setToolTip("Expand details")
         self.collapse_button.clicked.connect(self.toggle_requested.emit)
 
@@ -219,7 +219,7 @@ class ProjectDetails(QFrame):
         rail_layout = QVBoxLayout(rail)
         rail_layout.setContentsMargins(2, 8, 2, 8)
         rail_layout.addStretch(1)
-        rail_layout.addWidget(self.collapse_button)
+        rail_layout.addWidget(self.collapse_button, 0, Qt.AlignmentFlag.AlignHCenter)
         rail_layout.addStretch(1)
 
         layout = QHBoxLayout(self)

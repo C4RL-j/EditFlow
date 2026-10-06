@@ -12,8 +12,10 @@ from ui.main_window import MainWindow
 
 
 APP_ROOT = Path(__file__).resolve().parent
-DB_PATH = APP_ROOT / "data" / "editflow.db"
-LOGO_PATH = APP_ROOT / "assets" / "logos" / "Logo.png"
+RESOURCE_ROOT = Path(getattr(sys, "_MEIPASS", APP_ROOT))
+DATA_ROOT = Path(sys.executable).resolve().parent / "data" if getattr(sys, "frozen", False) else APP_ROOT / "data"
+DB_PATH = DATA_ROOT / "editflow.db"
+LOGO_PATH = RESOURCE_ROOT / "assets" / "logos" / "Logo.png"
 
 
 def main() -> int:

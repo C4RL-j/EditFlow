@@ -793,6 +793,89 @@ class ProjectService:
             self.projects_root(),
         )
 
+    def rename_project(self, project: Project, new_name: str) -> Project:
+        if project.id is None:
+            raise ValueError("Project must be saved before it can be renamed.")
+        clean_name = self._safe_project_folder_name(new_name)
+        source_folder = project.folder_path.expanduser()
+        if not source_folder.exists() or not source_folder.is_dir():
+            raise FileNotFoundError(f"Project folder not found: {source_folder}")
+
+        old_folder = source_folder.resolve(strict=False)
+        if clean_name == project.name and clean_name == old_folder.name:
+            return self._require_project(project.id)
+
+        if clean_name == old_folder.name:
+            target_folder = old_folder
+        else:
+            target_folder = safe_child_path(old_folder.parent, clean_name, is_folder=True)
+            target_folder = target_folder.resolve(strict=False)
+
+        if self._path_is_relative_to(target_folder, old_folder) and target_folder != old_folder:
+            raise ValueError("Cannot rename a project folder into itself.")
+
+        moved = False
+        try:
+            if old_folder != target_folder:
+                shutil.move(str(old_folder), str(target_folder))
+                moved = True
+            ensure_linked_assets_folder(target_folder)
+        except Exception as error:
+            raise OSError(f"Could not rename project folder: {error}") from error
+
+        try:
+            with self.database.connect() as connection:
+                self._update_project_paths_after_folder_move(
+                    connection,
+                    project,
+                    old_folder,
+                    target_folder,
+                    project.status,
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET name = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (clean_name, project.id),
+                )
+        except Exception as error:
+            if moved:
+                try:
+                    if target_folder.exists() and not old_folder.exists():
+                        shutil.move(str(target_folder), str(old_folder))
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        "Project folder was renamed, but EditFlow could not update the database "
+                        "and could not move the folder back. "
+                        f"Renamed folder: {target_folder}. Database error: {error}. "
+                        f"Rollback error: {rollback_error}"
+                    ) from error
+            raise
+
+        updated = self._require_project(project.id)
+        self.log_activity(
+            "project_renamed",
+            f"{project.name} renamed to {updated.name}",
+            project_id=updated.id,
+        )
+        return updated
+
+    def _safe_project_folder_name(self, name: str) -> str:
+        clean = re.sub(r'[<>:"/\\|?*]+', " ", name).strip().rstrip(".")
+        clean = re.sub(r"\s+", " ", clean)
+        if not clean:
+            raise ValueError("Project name cannot be empty.")
+        reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        }
+        if clean.upper() in reserved:
+            clean = f"{clean} Project"
+        return clean
+
     def _published_projects_root(self) -> Path:
         root = self.projects_root() / PUBLISHED_STATUS
         root.mkdir(parents=True, exist_ok=True)
@@ -1753,6 +1836,18 @@ class ProjectService:
         assets = [self._require_asset(asset_id) for asset_id in expanded_ids]
         top_assets = self._top_level_assets(asset_ids)
 
+        if delete_files:
+            for asset in sorted(
+                top_assets,
+                key=lambda item: len(item.file_path.parts),
+                reverse=True,
+            ):
+                path = asset.file_path
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists() or path.is_symlink():
+                    path.unlink()
+
         self._remove_project_asset_links(expanded_ids)
         placeholders = ", ".join("?" for _id in expanded_ids)
         with self.database.connect() as connection:
@@ -1768,18 +1863,6 @@ class ProjectService:
                 f"DELETE FROM assets WHERE id IN ({placeholders})",
                 tuple(expanded_ids),
             )
-
-        if delete_files:
-            for asset in sorted(
-                top_assets,
-                key=lambda item: len(item.file_path.parts),
-                reverse=True,
-            ):
-                path = asset.file_path
-                if path.is_dir():
-                    shutil.rmtree(path)
-                elif path.exists() or path.is_symlink():
-                    path.unlink()
 
         self.log_activity(
             "assets_deleted",

@@ -203,9 +203,16 @@ def _read_video_thumbnail(path: Path) -> QImage:
     QTimer.singleShot(350, lambda: player.setPosition(1200))
     loop.exec()
 
-    player.stop()
-    player.setVideoSink(None)
-    player.setSource(QUrl())
+    timeout.stop()
+    for action in (
+        player.stop,
+        lambda: player.setVideoSink(None),
+        lambda: player.setSource(QUrl()),
+    ):
+        try:
+            action()
+        except (RuntimeError, TypeError):
+            pass
 
     image = result["image"]
     if image.isNull():
@@ -217,8 +224,8 @@ def _render_video_tile(path: Path) -> QImage:
     canvas = _base_tile("#102236", "#243b62")
     painter = QPainter(canvas)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#eef3ff"))
-    painter.setPen(QPen(QColor("#eef3ff")))
+    painter.setBrush(QColor("#FFFFFF"))
+    painter.setPen(QPen(QColor("#FFFFFF")))
     triangle = QPolygon(
         [
             QPoint(67, 32),
