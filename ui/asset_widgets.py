@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QMimeData, Qt, Signal
-from PySide6.QtGui import QDrag
-from PySide6.QtWidgets import QAbstractItemView, QListWidget, QTableWidget, QTreeWidget
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QPainter, QPen, QPolygon
+from PySide6.QtWidgets import QAbstractItemView, QListWidget, QProxyStyle, QStyle, QStyleOption, QTableWidget, QTreeWidget
 
 from ui.project_card import ASSET_IDS_MIME, ASSET_MIME
 
@@ -12,6 +12,40 @@ from ui.project_card import ASSET_IDS_MIME, ASSET_MIME
 ASSET_ID_ROLE = Qt.ItemDataRole.UserRole
 ASSET_PATH_ROLE = Qt.ItemDataRole.UserRole + 1
 ASSET_TYPE_ROLE = Qt.ItemDataRole.UserRole + 2
+ASSET_BRANCH_COLOR = "#168BFF"
+ASSET_BRANCH_HOVER_COLOR = "#25D7F2"
+
+
+class AssetBranchStyle(QProxyStyle):
+    def drawPrimitive(self, element, option: QStyleOption, painter: QPainter, widget=None) -> None:
+        if element != QStyle.PrimitiveElement.PE_IndicatorBranch or not option.state & QStyle.StateFlag.State_Children:
+            super().drawPrimitive(element, option, painter, widget)
+            return
+
+        color = ASSET_BRANCH_HOVER_COLOR if option.state & QStyle.StateFlag.State_MouseOver else ASSET_BRANCH_COLOR
+        rect = option.rect
+        size = max(7, min(11, rect.width() - 4, rect.height() - 4))
+        center = rect.center()
+        half = size // 2
+        if option.state & QStyle.StateFlag.State_Open:
+            points = QPolygon([
+                QPoint(center.x() - half, center.y() - half // 2),
+                QPoint(center.x(), center.y() + half // 2),
+                QPoint(center.x() + half, center.y() - half // 2),
+            ])
+        else:
+            points = QPolygon([
+                QPoint(center.x() - half // 2, center.y() - half),
+                QPoint(center.x() + half // 2, center.y()),
+                QPoint(center.x() - half // 2, center.y() + half),
+            ])
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(color), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(points)
+        painter.restore()
 
 
 class AssetTableWidget(QTableWidget):
@@ -57,10 +91,14 @@ class AssetTableWidget(QTableWidget):
 
 class AssetLibraryTree(QTreeWidget):
     assets_moved = Signal(list, object)
+    external_paths_dropped = Signal(list, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.root_path: Path | None = None
+        self._branch_style = AssetBranchStyle()
+        self.setStyle(self._branch_style)
+        self.setMouseTracking(True)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
@@ -112,15 +150,35 @@ class AssetLibraryTree(QTreeWidget):
         if event.mimeData().hasFormat(ASSET_IDS_MIME):
             event.acceptProposedAction()
             return
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
         if event.mimeData().hasFormat(ASSET_IDS_MIME):
             event.acceptProposedAction()
             return
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
         super().dragMoveEvent(event)
 
     def dropEvent(self, event) -> None:
+        if event.mimeData().hasUrls() and not event.mimeData().hasFormat(ASSET_IDS_MIME):
+            paths = [
+                Path(url.toLocalFile())
+                for url in event.mimeData().urls()
+                if url.isLocalFile()
+            ]
+            destination = self._drop_destination(event.position().toPoint())
+            if paths and destination is not None:
+                self.external_paths_dropped.emit(paths, destination)
+                event.acceptProposedAction()
+                return
+            event.ignore()
+            return
+
         if not event.mimeData().hasFormat(ASSET_IDS_MIME):
             super().dropEvent(event)
             return
@@ -138,7 +196,15 @@ class AssetLibraryTree(QTreeWidget):
             event.ignore()
             return
 
-        target_item = self.itemAt(event.position().toPoint())
+        destination = self._drop_destination(event.position().toPoint())
+        if destination is None:
+            event.ignore()
+            return
+        self.assets_moved.emit(asset_ids, destination)
+        event.acceptProposedAction()
+
+    def _drop_destination(self, position) -> Path | None:
+        target_item = self.itemAt(position)
         destination = self.root_path
         if target_item is not None:
             path_value = target_item.data(0, ASSET_PATH_ROLE)
@@ -146,11 +212,7 @@ class AssetLibraryTree(QTreeWidget):
             if isinstance(path_value, str):
                 target_path = Path(path_value)
                 destination = target_path if type_value == "folder" else target_path.parent
-        if destination is None:
-            event.ignore()
-            return
-        self.assets_moved.emit(asset_ids, destination)
-        event.acceptProposedAction()
+        return destination
 
 
 class AssetListWidget(QListWidget):

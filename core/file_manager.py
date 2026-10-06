@@ -328,12 +328,18 @@ def _create_file_url_shortcut(shortcut_path: Path, source: Path) -> None:
     )
 
 
+def _numbered_duplicate_path(path: Path, index: int) -> Path:
+    if path.suffix:
+        return path.with_name(f"{path.stem} ({index}){path.suffix}")
+    return path.with_name(f"{path.name} ({index})")
+
+
 def _deduplicate_path(path: Path) -> Path:
     if not path.exists():
         return path
 
     for index in range(2, 1000):
-        candidate = path.with_name(f"{path.stem} {index}{path.suffix}")
+        candidate = _numbered_duplicate_path(path, index)
         if not candidate.exists():
             return candidate
     raise FileExistsError(f"Could not find an available file name for {path}")
@@ -344,7 +350,7 @@ def _deduplicate_folder_path(path: Path) -> Path:
         return path
 
     for index in range(2, 1000):
-        candidate = path.with_name(f"{path.name} {index}")
+        candidate = _numbered_duplicate_path(path, index)
         if not candidate.exists():
             return candidate
     raise FileExistsError(f"Could not find an available folder name for {path}")
@@ -354,11 +360,8 @@ def _deduplicate_link_path(path: Path) -> Path:
     if not path.exists() and not path.is_symlink():
         return path
 
-    suffix = path.suffix
-    stem = path.stem if suffix else path.name
     for index in range(2, 1000):
-        candidate_name = f"{stem} {index}{suffix}"
-        candidate = path.with_name(candidate_name)
+        candidate = _numbered_duplicate_path(path, index)
         if not candidate.exists() and not candidate.is_symlink():
             return candidate
     raise FileExistsError(f"Could not find an available link name for {path}")

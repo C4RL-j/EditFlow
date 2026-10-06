@@ -19,10 +19,10 @@ from ui.project_card import PROJECT_MIME, ProjectCard
 
 
 STATUS_ACCENTS: dict[str, str] = {
-    "Need Edit": "#7aa2ff",
-    "Editing": "#5ed1ff",
-    "Need Upload": "#ffd166",
-    "Done": "#56e39f",
+    "Need Edit": "#25D7F2",
+    "Editing": "#168BFF",
+    "Need Upload": "#FBBF24",
+    "Done": "#35d07f",
 }
 
 
@@ -110,6 +110,7 @@ class KanbanColumn(QFrame):
     assets_dropped = Signal(object, list)
     video_preview_requested = Signal(object, str)
     edited_video_requested = Signal(object)
+    edited_video_dropped = Signal(object, object)
     open_folder_requested = Signal(object)
     copy_folder_path_requested = Signal(object)
     priority_toggle_requested = Signal(object)
@@ -191,7 +192,7 @@ class KanbanColumn(QFrame):
         if self.status == "Need Edit":
             layout.addWidget(self.add_button)
 
-        self._set_accent(STATUS_ACCENTS.get(status, "#7d8ca5"))
+        self._set_accent(STATUS_ACCENTS.get(status, "#8EA4C2"))
 
     def set_projects(self, projects: list[Project], selected_project_id: int | None) -> None:
         self._clear_cards()
@@ -222,6 +223,7 @@ class KanbanColumn(QFrame):
         card.project_drag_left.connect(self.hide_drop_indicator)
         card.video_preview_requested.connect(self.video_preview_requested.emit)
         card.edited_video_requested.connect(self.edited_video_requested.emit)
+        card.edited_video_dropped.connect(self.edited_video_dropped.emit)
         card.open_folder_requested.connect(self.open_folder_requested.emit)
         card.copy_folder_path_requested.connect(self.copy_folder_path_requested.emit)
         card.priority_toggle_requested.connect(self.priority_toggle_requested.emit)
@@ -269,8 +271,8 @@ class KanbanColumn(QFrame):
         self.setStyleSheet(
             f"""
             QFrame#KanbanColumn {{
-                background: #151d2a;
-                border: 1px solid #303d52;
+                background: #0B1728;
+                border: 1px solid #223653;
                 border-top: 2px solid {color};
                 border-radius: 8px;
             }}
@@ -516,6 +518,7 @@ class KanbanBoard(QWidget):
     assets_dropped = Signal(object, list)
     video_preview_requested = Signal(object, str)
     edited_video_requested = Signal(object)
+    edited_video_dropped = Signal(object, object)
     open_folder_requested = Signal(object)
     copy_folder_path_requested = Signal(object)
     priority_toggle_requested = Signal(object)
@@ -556,6 +559,7 @@ class KanbanBoard(QWidget):
             column.assets_dropped.connect(self.assets_dropped.emit)
             column.video_preview_requested.connect(self.video_preview_requested.emit)
             column.edited_video_requested.connect(self.edited_video_requested.emit)
+            column.edited_video_dropped.connect(self.edited_video_dropped.emit)
             column.open_folder_requested.connect(self.open_folder_requested.emit)
             column.copy_folder_path_requested.connect(
                 self.copy_folder_path_requested.emit

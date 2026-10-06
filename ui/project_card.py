@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from html import escape
 from pathlib import Path
@@ -13,11 +13,13 @@ from PySide6.QtCore import (
     QRect,
     QRectF,
     Qt,
+    QUrl,
     QPropertyAnimation,
+    QSequentialAnimationGroup,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QDrag, QPainter, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QDrag, QPainter, QPen, QPixmap, QPolygon, QRegion
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsEffect,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -42,6 +45,75 @@ from models.project import (
 PROJECT_MIME = "application/x-editflow-project-id"
 ASSET_MIME = "application/x-editflow-asset-id"
 ASSET_IDS_MIME = "application/x-editflow-asset-ids"
+EDITED_VIDEO_DROP_EXTENSIONS = {".mp4"}
+
+
+CAPCUT_MOTION_BLUR_CACHE = Path(
+    r"C:\Users\TAO\AppData\Local\CapCut\User Data\Cache\MotionBlurCache"
+)
+
+
+class CornerTabButton(QWidget):
+    SIZE = 26
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._hovered = False
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Open CapCut MotionBlurCache")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._apply_triangle_mask()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_triangle_mask()
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_cache_folder()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#8A94A3" if self._hovered else "#5E6877"))
+        painter.drawPolygon(self._triangle())
+
+    def _triangle(self) -> QPolygon:
+        return QPolygon(
+            [
+                QPoint(0, 0),
+                QPoint(self.width(), 0),
+                QPoint(0, self.height()),
+            ]
+        )
+
+    def _apply_triangle_mask(self) -> None:
+        self.setMask(QRegion(self._triangle()))
+
+    def _open_cache_folder(self) -> None:
+        if not CAPCUT_MOTION_BLUR_CACHE.exists():
+            QMessageBox.warning(
+                self,
+                "CapCut Cache Not Found",
+                f"This folder does not exist:\n{CAPCUT_MOTION_BLUR_CACHE}",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(CAPCUT_MOTION_BLUR_CACHE)))
 
 
 class CardVisualEffect(QGraphicsEffect):
@@ -51,6 +123,9 @@ class CardVisualEffect(QGraphicsEffect):
         self._scale = 1.0
         self._lift = 0.0
         self._shadow_opacity = 0.0
+        self._selected = False
+        self._flow_active = False
+        self._flow_pulse = 0.0
 
     def opacity(self) -> float:
         return self._opacity
@@ -82,15 +157,36 @@ class CardVisualEffect(QGraphicsEffect):
         self._shadow_opacity = max(0.0, min(1.0, float(value)))
         self.update()
 
+    def setSelected(self, selected: bool) -> None:
+        self._selected = bool(selected)
+        self.updateBoundingRect()
+        self.update()
+
+    def setFlowActive(self, active: bool) -> None:
+        self._flow_active = bool(active)
+        self.updateBoundingRect()
+        self.update()
+
+    def flowPulse(self) -> float:
+        return self._flow_pulse
+
+    def setFlowPulse(self, value: float) -> None:
+        self._flow_pulse = max(0.0, min(1.0, float(value)))
+        self.updateBoundingRect()
+        self.update()
+
     opacity = Property(float, opacity, setOpacity)
     scale = Property(float, scale, setScale)
     lift = Property(float, lift, setLift)
     shadowOpacity = Property(float, shadowOpacity, setShadowOpacity)
+    flowPulse = Property(float, flowPulse, setFlowPulse)
 
     def boundingRectFor(self, rect: QRectF) -> QRectF:
         scale_extra = (self._scale - 1.0) * max(rect.width(), rect.height()) / 2
         shadow_extra = 8.0 * self._shadow_opacity
-        extra = max(2.0, scale_extra + shadow_extra + 2)
+        selection_extra = 4.0 if self._selected else 0.0
+        flow_extra = 7.0 if self._flow_active else 0.0
+        extra = max(2.0, scale_extra + shadow_extra + selection_extra + flow_extra + 2)
         return rect.adjusted(-extra, -extra - self._lift, extra, extra + shadow_extra)
 
     def draw(self, painter: QPainter) -> None:
@@ -131,6 +227,41 @@ class CardVisualEffect(QGraphicsEffect):
             painter.scale(self._scale, self._scale)
             painter.translate(-target.center())
         painter.drawPixmap(target.topLeft(), pixmap)
+
+        if self._flow_active:
+            pulse = self._flow_pulse
+            glow_alpha = int(22 + 34 * pulse)
+            border_alpha = int(120 + 105 * pulse)
+            border_width = 1.2 + 1.0 * pulse
+            flow_rect = target.adjusted(-3.5, -3.5, 3.5, 3.5)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            glow = QColor("#168BFF")
+            glow.setAlpha(glow_alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(glow)
+            painter.drawRoundedRect(flow_rect.adjusted(-2.0, -2.0, 2.0, 2.0), 12, 12)
+
+            accent = QColor("#25D7F2")
+            accent.setAlpha(border_alpha)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(accent, border_width))
+            painter.drawRoundedRect(flow_rect, 11, 11)
+
+        if self._selected:
+            selection_rect = target.adjusted(-2.0, -2.0, 2.0, 2.0)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            highlight = QColor("#25D7F2")
+            highlight.setAlpha(22)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(highlight)
+            painter.drawRoundedRect(selection_rect, 10, 10)
+
+            outline = QColor("#25D7F2")
+            outline.setAlpha(235)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(outline, 1.6))
+            painter.drawRoundedRect(selection_rect.adjusted(0.8, 0.8, -0.8, -0.8), 10, 10)
+
         painter.restore()
 
 
@@ -301,8 +432,8 @@ class NotePreviewPopup(QWidget):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor("#42536f"))
-        painter.setBrush(QColor("#111824"))
+        painter.setPen(QColor("#223653"))
+        painter.setBrush(QColor("#101E32"))
         if self._tail_side == "bottom":
             bubble = self.rect().adjusted(0, 0, -1, -self.TAIL_HEIGHT - 1)
             tail = [
@@ -347,6 +478,7 @@ class ProjectCard(QFrame):
     project_drag_left = Signal()
     video_preview_requested = Signal(object, str)
     edited_video_requested = Signal(object)
+    edited_video_dropped = Signal(object, object)
     open_folder_requested = Signal(object)
     copy_folder_path_requested = Signal(object)
     priority_toggle_requested = Signal(object)
@@ -405,6 +537,21 @@ class ProjectCard(QFrame):
         )
         self._hover_shadow_animation.setDuration(140)
         self._hover_shadow_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._flow_pulse_animation = QSequentialAnimationGroup(self)
+        flow_brighten = QPropertyAnimation(self._visual_effect, b"flowPulse", self)
+        flow_brighten.setDuration(800)
+        flow_brighten.setStartValue(0.0)
+        flow_brighten.setEndValue(1.0)
+        flow_brighten.setEasingCurve(QEasingCurve.Type.InOutSine)
+        flow_soften = QPropertyAnimation(self._visual_effect, b"flowPulse", self)
+        flow_soften.setDuration(800)
+        flow_soften.setStartValue(1.0)
+        flow_soften.setEndValue(0.0)
+        flow_soften.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._flow_pulse_animation.addAnimation(flow_brighten)
+        self._flow_pulse_animation.addAnimation(flow_soften)
+        self._flow_pulse_animation.setLoopCount(-1)
+        self._set_flow_visual(project.in_flow)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(
@@ -413,11 +560,19 @@ class ProjectCard(QFrame):
         )
         self.setToolTip(self._readiness_message())
 
+        self.corner_tab_button = CornerTabButton(self)
+
         self.raw_thumbnail_label = self._thumbnail_label("Raw")
         self.edited_thumbnail_label = self._thumbnail_label("Edited")
+        self.edited_thumbnail_label.setAcceptDrops(True)
+        self.edited_thumbnail_label.setProperty("drop_active", "false")
         self.edited_thumbnail_label.setVisible(project.has_edited_video)
-        self.add_edited_button = QPushButton("+ Add\nEdited Video", self)
+        self._add_edited_button_text = "+ Add\nEdited Video"
+        self.add_edited_button = QPushButton(self._add_edited_button_text, self)
         self.add_edited_button.setObjectName("AddEditedVideoButton")
+        self.add_edited_button.setProperty("drop_active", "false")
+        self.add_edited_button.setAcceptDrops(True)
+        self.add_edited_button.installEventFilter(self)
         self.add_edited_button.setFixedSize(86, 40)
         self.add_edited_button.setToolTip("Add Edited Video")
         self.add_edited_button.clicked.connect(
@@ -546,8 +701,18 @@ class ProjectCard(QFrame):
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
+        self._visual_effect.setSelected(selected)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def _set_flow_visual(self, active: bool) -> None:
+        self._visual_effect.setFlowActive(active)
+        if active:
+            if self._flow_pulse_animation.state() != QSequentialAnimationGroup.State.Running:
+                self._flow_pulse_animation.start()
+            return
+        self._flow_pulse_animation.stop()
+        self._visual_effect.setFlowPulse(0.0)
 
     def _set_drag_visual(self, dragging: bool) -> None:
         if dragging:
@@ -619,13 +784,20 @@ class ProjectCard(QFrame):
 
     def _position_overlay_icons(self) -> None:
         margin = 7
-        self.note_indicator.move(margin, margin)
-        self.note_indicator.raise_()
-        self.priority_button.move(
-            max(margin, self.width() - self.priority_button.width() - margin),
-            margin,
-        )
+        spacing = 4
+        self.corner_tab_button.move(0, 0)
+        self.corner_tab_button.raise_()
+
+        right_x = max(margin, self.width() - self.priority_button.width() - margin)
+
+        self.priority_button.move(right_x, margin)
         self.priority_button.raise_()
+
+        note_y = margin
+        if not self.priority_button.isHidden():
+            note_y = margin + self.priority_button.height() + spacing
+        self.note_indicator.move(right_x, note_y)
+        self.note_indicator.raise_()
 
     def _has_notes(self) -> bool:
         return bool(self.project.notes.strip())
@@ -674,7 +846,7 @@ class ProjectCard(QFrame):
             return (
                 "<div><b>Notes</b><br>"
                 "<span>No notes yet.</span><br>"
-                "<span style='color:#9fb0c7;'>Click to add a note.</span></div>"
+                "<span style='color:#8EA4C2;'>Click to add a note.</span></div>"
             )
         preview = escape(note[:900]).replace("\n", "<br>")
         if len(note) > 900:
@@ -683,11 +855,35 @@ class ProjectCard(QFrame):
             "<div style='max-width:280px;'>"
             "<b>Notes</b><br>"
             f"<span>{preview}</span><br>"
-            "<span style='color:#9fb0c7;'>Click to edit.</span>"
+            "<span style='color:#8EA4C2;'>Click to edit.</span>"
             "</div>"
         )
 
     def eventFilter(self, watched, event) -> bool:
+        if self._is_edited_drop_target(watched):
+            if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
+                video_path = self._edited_video_path_from_mime(event.mimeData())
+                if video_path is not None:
+                    self._set_edited_drop_active(True)
+                    event.acceptProposedAction()
+                    return True
+                self._set_edited_drop_active(False)
+                event.ignore()
+                return True
+            if event.type() == QEvent.Type.DragLeave:
+                self._set_edited_drop_active(False)
+                event.accept()
+                return True
+            if event.type() == QEvent.Type.Drop:
+                video_path = self._edited_video_path_from_mime(event.mimeData())
+                self._set_edited_drop_active(False)
+                if video_path is not None:
+                    self.edited_video_dropped.emit(self.project, video_path)
+                    event.acceptProposedAction()
+                    return True
+                event.ignore()
+                return True
+
         if hasattr(self, "note_indicator") and watched == self.note_indicator:
             if event.type() == QEvent.Type.Enter:
                 self._show_note_preview()
@@ -740,6 +936,31 @@ class ProjectCard(QFrame):
                 event.accept()
                 return True
         return super().eventFilter(watched, event)
+
+    def _is_edited_drop_target(self, watched) -> bool:
+        return watched in {
+            getattr(self, "add_edited_button", None),
+            getattr(self, "edited_thumbnail_label", None),
+        }
+
+    def _edited_video_path_from_mime(self, mime_data) -> Path | None:
+        if not mime_data.hasUrls():
+            return None
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_file() and path.suffix.casefold() in EDITED_VIDEO_DROP_EXTENSIONS:
+                return path
+        return None
+
+    def _set_edited_drop_active(self, active: bool) -> None:
+        value = "true" if active else "false"
+        for widget in (self.add_edited_button, self.edited_thumbnail_label):
+            widget.setProperty("drop_active", value)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.add_edited_button.setText("Drop Edited Video" if active else self._add_edited_button_text)
 
     def _show_note_preview(self) -> None:
         if not self._has_note_preview() or self._dragging:

@@ -7,6 +7,7 @@ from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
@@ -633,8 +634,8 @@ class AssetPickerDialog(QDialog):
         self.media_player = QMediaPlayer(panel)
         self.media_audio_output = QAudioOutput(panel)
         self.media_audio_output.setVolume(0.65)
-        self.media_player.setAudioOutput(self.media_audio_output)
-        self.media_player.setVideoOutput(self.video_widget)
+        self._media_outputs_attached = False
+        self._attach_media_outputs()
         self.media_player.durationChanged.connect(self._set_media_duration)
         self.media_player.positionChanged.connect(self._set_media_position)
         self.media_player.playbackStateChanged.connect(self._update_media_play_button)
@@ -1097,6 +1098,13 @@ class AssetPickerDialog(QDialog):
         )
         self.favorite_button.setText("Favorite")
 
+    def _attach_media_outputs(self) -> None:
+        if getattr(self, "_media_outputs_attached", False):
+            return
+        self.media_player.setAudioOutput(self.media_audio_output)
+        self.media_player.setVideoOutput(self.video_widget)
+        self._media_outputs_attached = True
+
     def _render_preview_media(self, asset: Asset) -> None:
         self._stop_media_preview()
         self.preview_media.setPixmap(QPixmap())
@@ -1123,7 +1131,10 @@ class AssetPickerDialog(QDialog):
                 self.preview_media.setText("")
                 return
         if kind in {"Video", "Audio"} and asset.file_path.exists():
+            self._attach_media_outputs()
             self._media_source_path = asset.file_path
+            self.media_audio_output.setMuted(False)
+            self.media_audio_output.setVolume(max(0, min(self.volume_slider.value(), 100)) / 100)
             self.media_player.setSource(QUrl.fromLocalFile(str(asset.file_path)))
             self.position_slider.setRange(0, 0)
             self.position_slider.setValue(0)
@@ -1204,9 +1215,27 @@ class AssetPickerDialog(QDialog):
     def _stop_media_preview(self) -> None:
         if not hasattr(self, "media_player"):
             return
-        self.media_player.stop()
-        self.media_player.setSource(QUrl())
+        for action in (
+            self.media_player.stop,
+            lambda: self.media_player.setSource(QUrl()),
+            lambda: self.media_player.setVideoOutput(None),
+            lambda: self.media_player.setAudioOutput(None),
+        ):
+            try:
+                action()
+            except (RuntimeError, TypeError):
+                pass
+        self._media_outputs_attached = False
         self._media_source_path = None
+        if hasattr(self, "media_audio_output"):
+            for action in (
+                lambda: self.media_audio_output.setMuted(True),
+                lambda: self.media_audio_output.setVolume(0.0),
+            ):
+                try:
+                    action()
+                except RuntimeError:
+                    pass
         if hasattr(self, "play_button"):
             self.play_button.setText("Play")
         if hasattr(self, "position_slider"):
@@ -1214,6 +1243,9 @@ class AssetPickerDialog(QDialog):
             self.position_slider.setValue(0)
         if hasattr(self, "duration_label"):
             self.duration_label.setText("00:00 / 00:00")
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
 
     def _toggle_selected_favorite(self) -> None:
         selected_ids = self.selected_asset_ids()
